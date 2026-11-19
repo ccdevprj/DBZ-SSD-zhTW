@@ -2,9 +2,10 @@
 <plist version="1.0"><dict>
 <key>CFBundleExecutable</key><string>DBZLauncher</string>
 <key>CFBundleIdentifier</key><string>org.dbz-ssd.zhtw.macos</string>
-<key>CFBundleName</key><string>DBZ SSD RC2</string>
+<key>CFBundleName</key><string>DBZ SSD</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleVersion</key><string>2</string>
-<key>CFBundleShortVersionString</key><string>0.2</string>
+<key>CFBundleVersion</key><string>3</string>
+<key>CFBundleShortVersionString</key><string>0.2.1</string>
+<key>LSMinimumSystemVersion</key><string>11.0</string>
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
