@@ -53,3 +53,7 @@ SSD_DATA_DIR="$TEST_DATA" target/aarch64-apple-darwin/release/ssd-recompiled \
 ```
 
 Subsequent runs detect the installed cache without the install flag. In a normal Enhanced session ensure Options > Video > HD art is enabled.
+
+## Mac app icon
+
+The approved single-star icon is bundled as `macos/DBZ.icns` and declared by `CFBundleIconFile`. It contains Retina and standard sizes from 16 through 1024 pixels. The 16 px and 128 px renditions were inspected after decoding the ICNS. Rebuild with `bash macos/build.sh`; check the packaged icon and the app's code signature before distribution. This changes only the Mac bundle and does not change the game, platform ports or player data.

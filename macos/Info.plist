@@ -3,6 +3,7 @@
 <key>CFBundleExecutable</key><string>DBZLauncher</string>
 <key>CFBundleIdentifier</key><string>org.dbz-ssd.zhtw.macos</string>
 <key>CFBundleName</key><string>DBZ SSD</string>
+<key>CFBundleIconFile</key><string>DBZ.icns</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleVersion</key><string>3</string>
 <key>CFBundleShortVersionString</key><string>0.2.1</string>
