@@ -3,8 +3,7 @@
 //!
 //! The numbers are computed here on every platform and tested on the host. The calls into `libandroid.so` exist on
 //! Android only. They are looked up at run time, because the API is level 33 and the app runs from level 26: where a
-//! symbol is missing or the device refuses a session, no session is made and the reports do nothing. Elsewhere a
-//! session only keeps its target.
+//! symbol is missing no session is made and the reports do nothing. Elsewhere a session only keeps its target.
 
 use std::time::Duration;
 
@@ -166,8 +165,11 @@ mod android {
             // SAFETY: `tids` holds `len` thread ids of this process, and it lives across the call.
             let session =
                 unsafe { (api.create_session)(manager, tids.as_ptr(), tids.len(), target_ns) };
+            // A refused session is null. No `Live` may be made of it, not even one that is dropped at once (as
+            // `bool::then_some` would make): `Drop` would close a null session, and
+            // `APerformanceHint_closeSession` aborts the process on one ("session is nullptr").
             if session.is_null() {
-                log::warn!("Android Performance Hint session refused; continuing without hints");
+                log::info!("the system refused a Performance Hint session: the frames are not reported");
                 return None;
             }
             Some(Self { session, api })
@@ -188,6 +190,10 @@ mod android {
 
     impl Drop for Live {
         fn drop(&mut self) {
+            // `open` never keeps a null session; closing one aborts the process, so it is checked here too.
+            if self.session.is_null() {
+                return;
+            }
             // SAFETY: the session was made by `open` and is closed once, here.
             unsafe { (self.api.close_session)(self.session) };
         }
