@@ -169,7 +169,9 @@ mod android {
             // `bool::then_some` would make): `Drop` would close a null session, and
             // `APerformanceHint_closeSession` aborts the process on one ("session is nullptr").
             if session.is_null() {
-                log::info!("the system refused a Performance Hint session: the frames are not reported");
+                log::info!(
+                    "the system refused a Performance Hint session: the frames are not reported"
+                );
                 return None;
             }
             Some(Self { session, api })
