@@ -39,7 +39,7 @@ use crate::pack::Pack;
 use crate::translate::{Beneath, Overlay, Target, Translator};
 use crate::{Binder, Frame, HdFrame, HdOptions, Memories, Pixel, Renderer, Unsupported, WIDTH};
 use rayon::prelude::*;
-use ssd_catalogue::engine::OnScreen;
+use ssd_catalogue::engine::{ObjectLists, OnScreen};
 use ssd_oracle::{CgramWrite, Color, FrameLog, LineEntry, LineRegs, OamWrite, VramWrite};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -271,6 +271,7 @@ pub struct WideRenderer {
     /// transformation started while it goes on (the conditions', [`Conditions::with_ssj_lightning`]).
     lightning: Option<crate::lightning::Overlay>,
     ssj_lightning: Option<u32>,
+    hide_field_ui: bool,
 }
 
 /// A part of an object the original drops, as a wide frame draws it.
@@ -401,6 +402,7 @@ impl WideRenderer {
             cost: crate::DrawCost::default(),
             lightning: None,
             ssj_lightning: None,
+            hide_field_ui: false,
         }
     }
 
@@ -427,6 +429,14 @@ impl WideRenderer {
     pub fn set_text_screen(&mut self, screen: Option<OnScreen>) {
         if let Some(translator) = self.translator.as_mut() {
             translator.screen = screen;
+        }
+    }
+
+    /// The lists of objects in the work RAM at the start of the next frame drawn ([`ssd_catalogue::engine`]), for
+    /// the translation's rows that spell a name objects share.
+    pub fn set_object_lists(&mut self, lists: ObjectLists) {
+        if let Some(translator) = self.translator.as_mut() {
+            translator.objects = lists;
         }
     }
 
@@ -565,6 +575,13 @@ impl WideRenderer {
         options: WideOptions,
         hd: HdOptions,
     ) -> Result<WideHd, WideError> {
+        let quiet_field;
+        let log = if self.hide_field_ui {
+            quiet_field = without_field_ui(log);
+            &quiet_field
+        } else {
+            log
+        };
         let started = std::time::Instant::now();
         self.compose_time = std::time::Duration::ZERO;
         assert!((1..=crate::MAX_SCALE).contains(&hd.scale), "the scale is 1 to 8");
@@ -1547,6 +1564,7 @@ enum Settled {
 /// work RAM it started from (the end of the frame before it), so the field's variables are the
 /// ones its NMI used. Feed it every frame of the run in order: the sprite line buffers carry over.
 pub struct WideRun {
+    hide_field_ui: bool,
     rom: Arc<[u8]>,
     /// The renderer; `None` while a picture is being drawn in the background (`drawing`).
     renderer: Option<WideRenderer>,
@@ -1578,11 +1596,12 @@ pub struct WideRun {
 /// conditions.
 type Started = (u8, Option<FieldState>, Conditions);
 
-/// What a picture of [`WideRun::note_hd_shared`] was drawn from: the frame's start, the text page handed to the
-/// renderer, the HD options and the render log. Equal inputs draw the same picture.
+/// What a picture of [`WideRun::note_hd_shared`] was drawn from: the frame's start, the text page and the lists of
+/// objects handed to the renderer, the HD options and the render log. Equal inputs draw the same picture.
 struct Inputs {
     started: Started,
     text: Option<OnScreen>,
+    objects: ObjectLists,
     hd: HdOptions,
     log: FrameLog,
 }
@@ -1592,12 +1611,14 @@ impl Inputs {
         &self,
         started: &Started,
         text: Option<&OnScreen>,
+        objects: &ObjectLists,
         hd: HdOptions,
         log: &FrameLog,
     ) -> bool {
         self.hd == hd
             && self.started == *started
             && self.text.as_ref() == text
+            && self.objects == *objects
             && same_log(&self.log, log)
     }
 }
@@ -1606,6 +1627,21 @@ impl Inputs {
 struct Drawn {
     inputs: Inputs,
     shared: SharedHd,
+}
+
+fn without_field_ui(log: &FrameLog) -> FrameLog {
+    let mut quiet = log.clone();
+    for entry in &mut quiet.entries {
+        let regs = &mut entry.regs;
+        // The field's faces and windows only. BG2, OBJ, scroll and Mode 7 are untouched.
+        if regs.bg_mode == 1 && regs.bg_map_base[0] == 0x6800 && regs.bg_map_base[2] == 0x2C00 {
+            for bg in [0, 2] {
+                regs.main_bg[bg] = false;
+                regs.sub_bg[bg] = false;
+            }
+        }
+    }
+    quiet
 }
 
 /// Whether two render logs hold the same frame (`FrameLog` has no `PartialEq`). The pattern names every field, so a
@@ -1641,11 +1677,14 @@ fn same_log(a: &FrameLog, b: &FrameLog) -> bool {
 
 /// The pages the message engine named, for the translation: at the end of the last frame noted, and at the start
 /// of the frame noted (or skipped) last; and the last page named at the end of a frame that was skipped, for the
-/// frame drawn next.
+/// frame drawn next. The lists of objects in the work RAM likewise, at the end of the last frame noted and at the
+/// start of the frame noted (or skipped) last.
 #[derive(Debug, Default)]
 struct TextRun {
     ended: Option<OnScreen>,
     started: Option<OnScreen>,
+    lists_ended: ObjectLists,
+    lists_started: ObjectLists,
     /// A page written at once (the Item help) is named for two frames only: when those frames run in a batch the
     /// window never draws (a fast-forward, or the frames the clock owes at speed 1), the frame drawn next starts
     /// from no page, and the overlay would keep the page before it (or none) over the new page's English.
@@ -1675,6 +1714,7 @@ impl WideRun {
     #[must_use]
     pub fn new(rom: &[u8]) -> Self {
         Self {
+            hide_field_ui: false,
             rom: Arc::from(rom),
             renderer: Some(WideRenderer::new()),
             worker: None,
@@ -1711,12 +1751,14 @@ impl WideRun {
         self.renderer().set_overlay(overlay);
     }
 
-    /// Tells the renderer the page the frame about to be drawn started from.
+    /// Tells the renderer the page and the lists of objects the frame about to be drawn started from.
     fn hand_text(&mut self) {
         // The page the frame started from, else the last page a skipped frame ended on (see [`TextRun::missed`])
         let started = self.text.as_mut().and_then(TextRun::hand);
-        if self.text.is_some() {
-            self.renderer().set_text_screen(started);
+        if let Some(lists) = self.text.as_ref().map(|text| text.lists_started.clone()) {
+            let renderer = self.renderer();
+            renderer.set_text_screen(started);
+            renderer.set_object_lists(lists);
         }
     }
 
@@ -1847,8 +1889,9 @@ impl WideRun {
         hd: HdOptions,
     ) -> Option<SharedHd> {
         let text = self.text.as_ref().and_then(|text| text.started.clone());
+        let objects = self.text.as_ref().map(|text| text.lists_started.clone()).unwrap_or_default();
         if let Some(drawn) = &self.shared
-            && drawn.inputs.is(&started, text.as_ref(), hd, log)
+            && drawn.inputs.is(&started, text.as_ref(), &objects, hd, log)
         {
             return Some(drawn.shared.clone());
         }
@@ -1864,7 +1907,7 @@ impl WideRun {
         let pending = renderer.art_pending();
         self.note_cost(false);
         let shared = SharedHd { serial: next_serial(), picture: Arc::new(picture) };
-        let inputs = Inputs { started, text, hd, log: log.clone() };
+        let inputs = Inputs { started, text, objects, hd, log: log.clone() };
         self.shared = (!pending).then(|| Drawn { inputs, shared: shared.clone() });
         Some(shared)
     }
@@ -1994,6 +2037,16 @@ impl WideRun {
         self.renderer().set_font(font);
     }
 
+    /// Suppresses the native field corner portraits and command window during Fly/Land transitions
+    /// in the 4:3 view, and invalidates the shared-picture cache when the flag changes.
+    pub fn set_hide_field_ui(&mut self, hide_field_ui: bool) {
+        if self.hide_field_ui != hide_field_ui {
+            self.hide_field_ui = hide_field_ui;
+            self.shared = None;
+            self.renderer().hide_field_ui = hide_field_ui;
+        }
+    }
+
     /// Measures the colours the art draws against the original's ([`crate::ArtStats::drawn`]).
     pub fn set_art_measure(&mut self, on: bool) {
         self.shared = None;
@@ -2070,6 +2123,8 @@ impl WideRun {
             let hint = text.ended.as_ref().map(|screen| screen.page);
             let now = ssd_catalogue::engine::on_screen(&self.rom, wram, hint);
             text.started = std::mem::replace(&mut text.ended, now);
+            let lists = ssd_catalogue::engine::object_lists_after(wram, &text.lists_ended);
+            text.lists_started = std::mem::replace(&mut text.lists_ended, lists);
         }
         let rom = Rom(&self.rom);
         let current = (
@@ -2741,6 +2796,10 @@ mod tests {
 
     /// [`state`] with the type of each object.
     fn state_of(blocks: u8, camera: (u16, u16), objects: &[(u8, i32, i32)]) -> FieldState {
+        FieldState::from_wram(&field_wram(blocks, camera, objects)).unwrap()
+    }
+
+    fn field_wram(blocks: u8, camera: (u16, u16), objects: &[(u8, i32, i32)]) -> Vec<u8> {
         let mut wram = vec![0; 0x20000];
         wram[0x24] = 0x06;
         wram[0x702] = 1;
@@ -2755,7 +2814,7 @@ mod tests {
             wram[at + 2..at + 4].copy_from_slice(&((x + i32::from(camera.0)) as u16).to_le_bytes());
             wram[at + 4..at + 6].copy_from_slice(&((y + i32::from(camera.1)) as u16).to_le_bytes());
         }
-        FieldState::from_wram(&wram).unwrap()
+        wram
     }
 
     /// A render log of the field for `state`: noise for the characters and the palette, BG2's
@@ -3653,6 +3712,99 @@ mod tests {
     }
 
     #[test]
+    fn hide_field_ui_hides_only_field_faces_and_windows_and_invalidates_cached_pictures() {
+        let mut log = plane(224);
+        for entry in &mut log.entries {
+            entry.regs.bg_mode = 1;
+            entry.regs.main_bg = [true, true, true, false];
+            entry.regs.sub_bg = [true, false, true, false];
+            entry.regs.bg_map_base[0] = 0x6800;
+            entry.regs.bg_map_base[2] = 0x2C00;
+        }
+        let quiet = without_field_ui(&log);
+        for (original, hidden) in log.entries.iter().zip(&quiet.entries) {
+            assert_eq!(hidden.regs.main_bg, [false, true, false, false]);
+            assert_eq!(hidden.regs.sub_bg, [false; 4]);
+            let mut restored = *hidden;
+            restored.regs.main_bg = original.regs.main_bg;
+            restored.regs.sub_bg = original.regs.sub_bg;
+            assert_eq!(
+                &restored, original,
+                "objects, scroll and animation registers are unchanged"
+            );
+        }
+        let mode7 = plane(224);
+        assert!(same_log(&mode7, &without_field_ui(&mode7)), "never remove a Mode 7 plane");
+        let mut run = WideRun::new(&rom());
+        let wram = vec![0; 0x20000];
+        let hd = HdOptions { scale: 2, look: crate::Look::Pixel };
+        let original = run.note_hd_shared(&wram, Some(&mode7), hd).unwrap();
+        let kept = run.note_hd_shared(&wram, Some(&mode7), hd).unwrap();
+        assert_eq!(original.serial, kept.serial);
+        run.set_hide_field_ui(true);
+        let changed = run.note_hd_shared(&wram, Some(&mode7), hd).unwrap();
+        assert_ne!(original.serial, changed.serial, "never reuse a different presentation");
+        assert_eq!(
+            original.picture.picture.rgba, changed.picture.picture.rgba,
+            "an unrelated scene remains pixel-identical"
+        );
+        run.set_hide_field_ui(false);
+        let restored = run.note_hd_shared(&wram, Some(&mode7), hd).unwrap();
+        assert_ne!(changed.serial, restored.serial);
+        assert_eq!(original.picture.picture.rgba, restored.picture.picture.rgba);
+    }
+
+    #[test]
+    fn hide_field_ui_removes_rendered_windows_but_preserves_the_map_and_objects() {
+        let rom = rom();
+        let wram = field_wram(2, CAMERA, &[]);
+        let state = FieldState::from_wram(&wram).unwrap();
+        let mut log = field_log(&rom, &state, &[(40, 70, 3, false)]);
+        opaque_objects(&mut log);
+        for entry in &mut log.entries {
+            entry.regs.main_bg = [true, true, true, false];
+            entry.regs.mode_1_bg3_priority = true;
+            entry.regs.bg_map_base[0] = 0x6800;
+            entry.regs.bg_map_base[2] = 0x2C00;
+            entry.regs.bg_char_base[0] = 0x4000;
+            entry.regs.bg_char_base[2] = 0x5000;
+        }
+        log.vram[0x6800..0x6C00].fill(0x2001);
+        log.vram[0x2C00..0x3000].fill(0x2001);
+        log.vram[0x4010..0x4018].fill(0x00FF);
+        log.vram[0x5008..0x5010].fill(0xFF00);
+        log.cgram_start[0x81] = 0x03FF;
+        let mut quiet = log.clone();
+        for entry in &mut quiet.entries {
+            entry.regs.main_bg[0] = false;
+            entry.regs.main_bg[2] = false;
+        }
+        let options = WideOptions { width: 372, hud: HudPlacement::Window };
+        let hd = HdOptions { scale: 2, look: crate::Look::Pixel };
+        let expected = WideRenderer::new()
+            .render_hd(Rom(&rom), 0x06, Some(&state), &quiet, options, hd)
+            .unwrap();
+        let mut no_objects = quiet.clone();
+        for entry in &mut no_objects.entries {
+            entry.regs.main_obj = false;
+        }
+        let without_objects = WideRenderer::new()
+            .render_hd(Rom(&rom), 0x06, Some(&state), &no_objects, options, hd)
+            .unwrap();
+        assert_ne!(expected.picture.rgba, without_objects.picture.rgba, "the fixture has objects");
+        let mut run = WideRun::new(&rom);
+        let original = run.note_hd_shared(&wram, Some(&log), hd).unwrap();
+        assert_eq!(original.picture.scene, Scene::Field);
+        assert_ne!(original.picture.picture.rgba, expected.picture.rgba, "the fixture has windows");
+        run.set_hide_field_ui(true);
+        let hidden = run.note_hd_shared(&wram, Some(&log), hd).unwrap();
+        assert_eq!(hidden.picture.picture.rgba, expected.picture.rgba);
+        run.set_hide_field_ui(false);
+        let restored = run.note_hd_shared(&wram, Some(&log), hd).unwrap();
+        assert_eq!(restored.picture.picture.rgba, original.picture.picture.rgba);
+    }
+
+    #[test]
     fn a_picture_that_lacks_art_being_read_is_not_given_again_for_the_same_frame() {
         let rom = rom();
         let wram = vec![0_u8; 0x20000];
@@ -3918,6 +4070,25 @@ mod tests {
 
     fn key(page: Option<OnScreen>) -> Option<String> {
         page.map(|page| page.key)
+    }
+
+    #[test]
+    fn a_shared_picture_is_drawn_again_when_only_the_object_lists_changed() {
+        // The two Scouters of the bag in one order, then the other: the rows spelling `Scouter` swap their names, so
+        // the picture is not the last one though the frame, its page and its log are the same
+        let started: Started = (0, None, Conditions::default());
+        let hd = HdOptions { scale: 2, look: crate::Look::Crisp };
+        let log = empty_log();
+        let lists = |items: Vec<u8>| ObjectLists { items, stock: None, ..ObjectLists::default() };
+        let inputs = Inputs {
+            started: started.clone(),
+            text: None,
+            objects: lists(vec![16, 17]),
+            hd,
+            log: log.clone(),
+        };
+        assert!(!inputs.is(&started, None, &lists(vec![17, 16]), hd, &log), "the order changed");
+        assert!(inputs.is(&started, None, &lists(vec![16, 17]), hd, &log), "the same lists");
     }
 
     #[test]

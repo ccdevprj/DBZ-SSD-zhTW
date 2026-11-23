@@ -8,6 +8,11 @@
 //! original's own refusal at [`LIST_FULL`] never fires while the bag has room. A full bag shows
 //! [`LIST_FULL`] entries: the original then refuses every pickup, purchase and battle drop by its own
 //! check, which is how the 61st stack is refused (`docs/re/data/menus.md`, "The capacity spike").
+//!
+//! The story searches that list itself for some objects that are not key items (both Scouters for the
+//! elder's trade, the Dragon Radar, Lunch, Vegeta, the "Moon" card, the Namek frog card:
+//! [`STORY_CHECKED`]), so a bag with more stacks than the list shows always lists the first stack of
+//! each of them: at most seven entries, which still leave room for others beside the nine key items.
 
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +32,21 @@ const DRAGON_BALLS: std::ops::RangeInclusive<u8> = 33..=39;
 /// only when the stack holds the same word, so a unit whose state changed (a wish used, a choice of a
 /// card changer) leaves its stack and becomes a stack of its own.
 const KEEPS_STATE: [u8; 6] = [9, 10, 11, 12, 13, 15];
+/// Objects that are not key items but that the original's story looks for in the list (`$0100`) by itself, to test
+/// that the party holds one or to take one away. A unit outside the projection is a unit the story does not see, so
+/// [`Bag::project`] always lists the first stack of each (`docs/re/data/menus.md`, "Objects the story looks for"):
+///
+/// - 9, Lunch: `03:9D64` (`CMP #$09`) sets a story flag when the party has one; `01:D812` (message `0x027`) takes it.
+/// - 16, the Scouter of 10 points: the Namek elder's trade (effect `0x64`, `03:D11F`) needs both Scouters (`01:C6AE`)
+///   and takes one of each (`03:D137`, `01:C69B`).
+/// - 17, the Scouter of 20 points: the same trade (`03:D127` searches, `03:D13D` takes).
+/// - 19, Vegeta: the story takes him away (effect `0x25`, `03:C001`, `01:C69B`).
+/// - 20, the "Moon" card: taken after the duel with Vegeta (`01:DB9D`, message `0x04E`) and in battle (`05:8538`,
+///   `1D:8A85`); a battle that does not find it removes the last entry of the list instead.
+/// - 23, the Dragon Radar: effect `0x6A` (`03:D28E`) and the map entry of `03:EC99` test that the party holds it
+///   (`01:C6AE`); the story gives one on Namek when it was not picked up.
+/// - 24, the Namek frog card: a battle uses it when the party holds one (`05:A30B`, `1D:8A85`).
+const STORY_CHECKED: [u8; 7] = [9, 16, 17, 19, 20, 23, 24];
 /// Porunga's object id.
 const PORUNGA: u8 = 15;
 /// The state word the original gives Porunga with the object (`04:D37E`): 150 wish points in the high byte (a wish costs
@@ -278,17 +298,48 @@ impl Bag {
     /// The entries the original list shows, as stack ids in list order: `front` first when given
     /// (the stack the HD stages for its use), then the key items, then the other stacks, in the
     /// order they were acquired. At most [`PROJECTED`] entries, or [`LIST_FULL`] when the bag is full.
+    ///
+    /// Which of the other stacks are shown is chosen before they are put in order: the first stack of
+    /// each object of [`STORY_CHECKED`] is always shown (unless `front` is already a stack of it),
+    /// because the original's story searches the list for it; the entries left are given to the other
+    /// stacks in the order they were acquired. A bag the list shows whole is so listed exactly as
+    /// before, and a longer one leaves out its latest other stacks instead of an object the story looks
+    /// for.
     #[must_use]
     pub fn project(&self, front: Option<u32>) -> Vec<u32> {
         let cap = if self.is_full() { LIST_FULL } else { PROJECTED };
         let front = front.filter(|&id| self.stack(id).is_some());
-        let rest = |key: bool| {
+        let mut order: Vec<u32> = front.into_iter().collect();
+        order.extend(
             self.stacks
                 .iter()
-                .filter(move |stack| stack.class.key == key && Some(stack.id) != front)
-                .map(|stack| stack.id)
-        };
-        let mut order: Vec<u32> = front.into_iter().chain(rest(true)).chain(rest(false)).collect();
+                .filter(|stack| stack.class.key && Some(stack.id) != front)
+                .map(|stack| stack.id),
+        );
+        let others: Vec<&Stack> = self
+            .stacks
+            .iter()
+            .filter(|stack| !stack.class.key && Some(stack.id) != front)
+            .collect();
+        let mut kept: Vec<u32> = Vec::new();
+        for stack in &others {
+            let listed = |id: &u32| self.stack(*id).is_some_and(|it| it.object == stack.object);
+            if STORY_CHECKED.contains(&stack.object)
+                && !order.iter().any(listed)
+                && !kept.iter().any(listed)
+            {
+                kept.push(stack.id);
+            }
+        }
+        let mut room = cap.saturating_sub(order.len() + kept.len());
+        for stack in others {
+            if kept.contains(&stack.id) {
+                order.push(stack.id);
+            } else if room > 0 {
+                room -= 1;
+                order.push(stack.id);
+            }
+        }
         order.truncate(cap);
         order
     }
@@ -584,7 +635,12 @@ mod tests {
     #[test]
     fn a_hidden_stack_can_be_staged_into_the_list() {
         let bag = bag_with(25);
-        let hidden = bag.stacks()[24].id;
+        // The latest stack the list leaves out: object 22, which the story does not look for (24 is always listed).
+        let hidden = bag.stacks()[22].id;
+        assert!(
+            !STORY_CHECKED.contains(&bag.stacks()[22].object),
+            "a stack the list may leave out"
+        );
         assert!(!bag.project(None).contains(&hidden));
         let staged = bag.project(Some(hidden));
         assert_eq!(staged[0], hidden);
@@ -617,6 +673,225 @@ mod tests {
             ids.dedup();
             assert_eq!(ids.len(), order.len(), "no stack is listed twice");
         }
+    }
+
+    /// The objects the ROM's story looks for in the list (the addresses are at [`STORY_CHECKED`]), written out again so a
+    /// list that loses one is caught.
+    const LOOKED_FOR: [u8; 7] = [9, 16, 17, 19, 20, 23, 24];
+
+    /// Twenty objects that are neither key items nor objects the story looks for.
+    const FILLERS: [u8; 20] =
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 18, 21, 22, 25, 27, 28];
+
+    /// The key items a game gives, one unit each: the seven Dragon Balls, Gohan (26) and the Namek frog (32), both of
+    /// them with the story bit.
+    const KEY_OBJECTS: [u8; 9] = [33, 34, 35, 36, 37, 38, 39, 26, 32];
+
+    /// The class of `object` as the game has it in these tests: Gohan and the Namek frog are story objects.
+    fn class_in_game(object: u8) -> Class {
+        Class::of(object, object == 26 || object == 32)
+    }
+
+    /// The projection as it was before the objects the story looks for were kept in it: `front`, the key items, then
+    /// the other stacks in the order they were acquired, cut at the cap. A bag the list shows whole still projects so.
+    fn projected_before(bag: &Bag, front: Option<u32>) -> Vec<u32> {
+        let cap = if bag.is_full() { LIST_FULL } else { PROJECTED };
+        let front = front.filter(|&id| bag.stack(id).is_some());
+        let rest = |key: bool| {
+            bag.stacks()
+                .iter()
+                .filter(move |stack| stack.class.key == key && Some(stack.id) != front)
+                .map(|stack| stack.id)
+        };
+        let mut order: Vec<u32> = front.into_iter().chain(rest(true)).chain(rest(false)).collect();
+        order.truncate(cap);
+        order
+    }
+
+    /// Whether the list `order` of `bag` has an entry of `object`.
+    fn lists_object(bag: &Bag, order: &[u32], object: u8) -> bool {
+        order.iter().any(|&id| bag.stack(id).is_some_and(|stack| stack.object == object))
+    }
+
+    #[test]
+    fn a_bag_the_list_shows_whole_keeps_its_order_and_a_longer_one_swaps_in_the_scouters() {
+        let mut bag = Bag::new(Rules::default());
+        let bulma = bag.add(2, 0, normal(2)).unwrap();
+        let ball = bag.add(33, 0, Class::of(33, false)).unwrap();
+        let s16 = bag.add(16, 0, normal(16)).unwrap();
+        let other = bag.add(5, 0, normal(5)).unwrap();
+        let s17 = bag.add(17, 0, normal(17)).unwrap();
+        assert_eq!(
+            bag.project(None),
+            [ball, bulma, s16, other, s17],
+            "a bag of five stacks is listed as before"
+        );
+        // Twenty stacks of other objects, then both Scouters: twenty-two stacks for twenty-one entries.
+        let mut long = Bag::new(Rules::default());
+        let fillers: Vec<u32> =
+            FILLERS.iter().map(|&object| long.add(object, 0, normal(object)).unwrap()).collect();
+        let s16 = long.add(16, 0, normal(16)).unwrap();
+        let s17 = long.add(17, 0, normal(17)).unwrap();
+        let mut expected = fillers[..19].to_vec();
+        expected.extend([s16, s17]);
+        assert_eq!(
+            long.project(None),
+            expected,
+            "the latest other stack (object 28) leaves the list to the Scouters the elder searches for"
+        );
+    }
+
+    #[test]
+    fn only_the_first_stack_of_an_object_the_story_looks_for_is_swapped_in() {
+        let mut bag = Bag::new(Rules { slots: 60, stack: 2 });
+        let bulma = bag.add(2, 0, normal(2)).unwrap();
+        let first = bag.add(16, 0, normal(16)).unwrap();
+        assert_eq!(bag.add(16, 0, normal(16)), Ok(first));
+        let second = bag.add(16, 0, normal(16)).unwrap();
+        assert_ne!(first, second, "two units fill the first stack");
+        assert_eq!(bag.project(None), [bulma, first, second], "three stacks are listed as before");
+        // Behind twenty-one other stacks, the first Scouter stack is swapped in and the second stays one of the others.
+        let mut long = Bag::new(Rules { slots: 60, stack: 1 });
+        let fillers: Vec<u32> = FILLERS
+            .iter()
+            .chain(&[0])
+            .map(|&object| long.add(object, 0, normal(object)).unwrap())
+            .collect();
+        let first = long.add(16, 0, normal(16)).unwrap();
+        let second = long.add(16, 0, normal(16)).unwrap();
+        let mut expected = fillers[..20].to_vec();
+        expected.push(first);
+        assert_eq!(long.project(None), expected);
+        assert!(!long.project(None).contains(&second), "the second stack is not kept in the list");
+    }
+
+    /// `03:A1C2` (the NPCs of type `$AB`) takes the first entry of the list that can be dropped (attribute bit 2 clear),
+    /// and `01:D9E9` (message `0x03E`) removes it. Lunch, both Scouters, Vegeta and the "Moon" card can be dropped
+    /// (`01:C584`), so the order of a bag the list shows whole is kept: the NPC takes the earliest droppable stack, as in
+    /// Classic, and not an object the story looks for that came after it. Every stack that is not a key item counts as
+    /// droppable here.
+    #[test]
+    fn the_first_droppable_entry_is_still_the_earliest_droppable_stack() {
+        let mut bag = Bag::new(Rules::default());
+        let bulma = bag.add(2, 0, normal(2)).unwrap();
+        bag.add(16, 0, normal(16)).unwrap();
+        let order = bag.project(None);
+        let first_droppable =
+            order.iter().copied().find(|&id| bag.stack(id).is_some_and(|stack| !stack.class.key));
+        assert_eq!(first_droppable, Some(bulma));
+    }
+
+    #[test]
+    fn every_object_the_story_looks_for_is_listed_in_a_bag_of_any_size() {
+        for keys in [&[][..], &KEY_OBJECTS[..]] {
+            let most = usize::from(SLOTS) - keys.len() - LOOKED_FOR.len();
+            for others in 0..=most {
+                let mut bag = Bag::new(Rules { slots: SLOTS, stack: 1 });
+                for &key in keys {
+                    bag.add(key, 0, class_in_game(key)).unwrap();
+                }
+                for index in 0..others {
+                    let object = FILLERS[index % FILLERS.len()];
+                    bag.add(object, 0, normal(object)).unwrap();
+                }
+                for &object in &LOOKED_FOR {
+                    bag.add(object, 0, normal(object)).unwrap();
+                }
+                let staged = (others > 0).then(|| bag.stacks()[keys.len() + others - 1].id);
+                for front in [None, staged] {
+                    let order = bag.project(front);
+                    for &object in &LOOKED_FOR {
+                        assert!(
+                            lists_object(&bag, &order, object),
+                            "{} key items, {others} other stacks, front {front:?}: {object} is listed",
+                            keys.len()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn property_an_object_the_story_looks_for_is_always_in_the_projection() {
+        let mut rng = Rng(0x5EED_0FB0_6A11_C0DE);
+        let mut longer = 0;
+        for round in 0..300 {
+            let rules = Rules { slots: 1 + rng.below(60) as u16, stack: 1 + rng.below(99) as u16 };
+            let mut bag = Bag::new(rules);
+            let mut keys_given: Vec<u8> = Vec::new();
+            for _ in 0..rng.below(250) {
+                let object = rng.below(40) as u8;
+                let class = class_in_game(object);
+                // The game gives a key item one at a time.
+                if class.key {
+                    if keys_given.contains(&object) {
+                        continue;
+                    }
+                    keys_given.push(object);
+                }
+                let _ = bag.add(object, 0, class);
+            }
+            let stacks = bag.stacks().len();
+            let front = (round % 2 == 1 && stacks > 0)
+                .then(|| bag.stacks()[rng.below(stacks as u64) as usize].id);
+            let order = bag.project(front);
+            let cap = if bag.is_full() { LIST_FULL } else { PROJECTED };
+            if stacks > cap {
+                longer += 1;
+            }
+            assert!(order.len() <= cap);
+            for &object in &LOOKED_FOR {
+                if bag.units_of(object) > 0 {
+                    assert!(
+                        lists_object(&bag, &order, object),
+                        "round {round}: {object} is in the bag and so in the list"
+                    );
+                }
+            }
+            let mut ids = order.clone();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(ids.len(), order.len(), "no stack is listed twice");
+            let skip = usize::from(front.is_some());
+            if let Some(front) = front {
+                assert_eq!(order[0], front, "the staged stack goes first");
+            }
+            let keys = bag.stacks().iter().filter(|s| s.class.key && Some(s.id) != front).count();
+            let shown_keys = order[skip..]
+                .iter()
+                .take_while(|id| bag.stack(**id).is_some_and(|s| s.class.key))
+                .count();
+            assert_eq!(shown_keys, keys.min(order.len() - skip), "key items follow the front");
+        }
+        assert!(longer >= 100, "{longer} rounds had more stacks than the list shows");
+    }
+
+    #[test]
+    fn property_a_bag_the_list_shows_whole_projects_as_before() {
+        let mut rng = Rng(0x0BAD_5EED_1234_ABCD);
+        let mut checked = 0;
+        for round in 0..600 {
+            let rules = Rules { slots: 1 + rng.below(60) as u16, stack: 1 + rng.below(99) as u16 };
+            let mut bag = Bag::new(rules);
+            for _ in 0..rng.below(60) {
+                let object = rng.below(40) as u8;
+                let _ = bag.add(object, 0, class_in_game(object));
+            }
+            let stacks = bag.stacks().len();
+            if stacks > PROJECTED {
+                continue;
+            }
+            let front = (round % 2 == 1 && stacks > 0)
+                .then(|| bag.stacks()[rng.below(stacks as u64) as usize].id);
+            assert_eq!(
+                bag.project(front),
+                projected_before(&bag, front),
+                "round {round}: a bag of {stacks} stacks"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 200, "{checked} bags of at most twenty-one stacks were checked");
     }
 
     #[test]

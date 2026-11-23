@@ -6,7 +6,7 @@
 use crate::names::{TEXT_BANK, table_name};
 use crate::rom::RomView;
 use crate::text::decode_tile;
-use crate::translation::{page_key, render, string_key};
+use crate::translation::{Translation, page_key, render, string_key};
 use ssd_game::data as d;
 use std::collections::{HashMap, HashSet};
 
@@ -501,7 +501,9 @@ type NameTable = (u32, u32, fn(u32) -> String);
 /// name). An entry that points at the string of an entry before it (in the order string, unit, attack, object) is
 /// that entry's name on screen and is skipped: the English patch points some entries at another's string (Nail's
 /// `unit:0x22` at Chiaotzu's `string:6`), which the translation names as they are in the story, and the screen
-/// spells them alike. Nothing of the ROM is kept but the map.
+/// spells them alike. A string objects share and the translation names apart (the two Scouters, the two Turtles) is
+/// no name at all here: one spelling cannot stand for two names, so those objects are named by id
+/// ([`object_names`]). Nothing of the ROM is kept but the map.
 #[must_use]
 pub fn screen_names(
     rom: &[u8],
@@ -514,11 +516,15 @@ pub fn screen_names(
         (d::ATTACK_NAME_POINTERS, d::ATTACK_NAME_POINTERS_SIZE, |i| format!("attack:{i}")),
         (d::OBJECT_NAME_POINTERS, d::OBJECT_NAME_POINTERS_SIZE, |i| format!("object:{i}")),
     ];
+    let apart = objects_named_apart(rom, table);
     let mut names: HashMap<String, Option<String>> = HashMap::new();
     let mut strings: HashSet<u32> = HashSet::new();
     for (pointers, size, key) in tables {
         for index in 0..size / 2 {
             let Ok(string) = rom.pointer(pointers + 2 * index, TEXT_BANK) else { continue };
+            if apart.contains_key(&string) {
+                continue;
+            }
             if !strings.insert(string) {
                 continue;
             }
@@ -602,6 +608,240 @@ fn add(names: &mut HashMap<String, Option<String>>, english: String, translated:
             }
         })
         .or_insert(Some(translated));
+}
+
+/// The objects' names as the screen spells them, and the objects a spelling cannot name: the English patch points
+/// some objects at one string (the two Scouters, 16 and 17; the two Turtles, 24 and 25), which a translation may
+/// name apart, and the screen spells them alike. Those are named by their id, which the lists the screen is written
+/// from hold ([`object_lists`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjectNames {
+    /// Each spelling of an object's name on the screen (the name, or the word before a tile the HD font has no
+    /// letter for, as [`screen_names`] takes a name of one word; two letters or more) and the objects spelled so,
+    /// from the lowest id.
+    pub spelled: HashMap<String, Vec<u8>>,
+    /// The objects to name by id and their translations (one line each). Empty when no shared string is named
+    /// apart (the English game, or a translation naming them alike): then every name goes by its spelling.
+    pub by_id: HashMap<u8, String>,
+}
+
+/// The objects' names of the ROM image `rom` as the screen spells them, and those of `table` to give by id: the
+/// objects that share a string `table` names apart ([`ObjectNames`]). An object whose string an entry of the
+/// string, unit or attack tables points at first is that entry's name on the screen, as in [`screen_names`], and
+/// is not named by id. Nothing of the ROM is kept.
+#[must_use]
+pub fn object_names(rom: &[u8], table: &crate::translation::Translation) -> ObjectNames {
+    let Ok(rom) = RomView::new(rom) else { return ObjectNames::default() };
+    let mut names = ObjectNames::default();
+    for index in 0..d::OBJECT_NAME_POINTERS_SIZE / 2 {
+        let Ok(id) = u8::try_from(index) else { continue };
+        let Ok(name) = table_name(rom, d::OBJECT_NAME_POINTERS, index) else { continue };
+        let english = name.trimmed();
+        let spelling = if name.is_text() { Some(english) } else { ended_word(english) };
+        if let Some(spelling) = spelling.filter(|spelling| spelling.chars().count() >= 2) {
+            names.spelled.entry(spelling.to_owned()).or_default().push(id);
+        }
+    }
+    for index in objects_named_apart(rom, table).into_values().flatten() {
+        let Ok(id) = u8::try_from(index) else { continue };
+        if let Some(translated) = object_translation(table, index) {
+            names.by_id.insert(id, translated);
+        }
+    }
+    names
+}
+
+/// The strings that objects share and `table` names apart, each with the objects pointing at it: a string no entry
+/// of the string, unit or attack tables points at (those come first on the screen, in the order of
+/// [`screen_names`]), two objects or more point at, and two of them or more have different translations.
+fn objects_named_apart(rom: RomView<'_>, table: &Translation) -> HashMap<u32, Vec<u32>> {
+    let before: [(u32, u32); 3] = [
+        (d::STRING_POINTERS, d::STRING_POINTERS_SIZE),
+        (d::UNIT_NAME_POINTERS, d::UNIT_NAME_POINTERS_SIZE),
+        (d::ATTACK_NAME_POINTERS, d::ATTACK_NAME_POINTERS_SIZE),
+    ];
+    let mut named_before: HashSet<u32> = HashSet::new();
+    for (pointers, size) in before {
+        for index in 0..size / 2 {
+            if let Ok(string) = rom.pointer(pointers + 2 * index, TEXT_BANK) {
+                named_before.insert(string);
+            }
+        }
+    }
+    let mut shared: HashMap<u32, Vec<u32>> = HashMap::new();
+    for index in 0..d::OBJECT_NAME_POINTERS_SIZE / 2 {
+        let Ok(string) = rom.pointer(d::OBJECT_NAME_POINTERS + 2 * index, TEXT_BANK) else {
+            continue;
+        };
+        if !named_before.contains(&string) {
+            shared.entry(string).or_default().push(index);
+        }
+    }
+    shared.retain(|_, objects| {
+        let translations: HashSet<String> =
+            objects.iter().filter_map(|&index| object_translation(table, index)).collect();
+        objects.len() >= 2 && translations.len() >= 2
+    });
+    shared
+}
+
+/// The translation of object `index` as one line, as [`screen_names`] renders a name; `None` where `table` has
+/// none or only blanks.
+fn object_translation(table: &Translation, index: u32) -> Option<String> {
+    let text = table.text(&format!("object:{index}"))?;
+    let translated = render(text, |_| String::new()).replace('\n', "");
+    (!translated.trim().is_empty()).then_some(translated)
+}
+
+/// The objects of the lists the original's screens write names from, in their order: the bag's list (`item_list`,
+/// the item menu's pages) and, while a shop is open, its stock (`shop_stock`: what it sells, or a copy of the bag
+/// while selling). A name the screen spells for two objects ([`ObjectNames::by_id`]) is told apart by the list
+/// its column is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjectLists {
+    /// The first byte (the object id) of each entry of `item_list` in use (`item_count`).
+    pub items: Vec<u8>,
+    /// The low byte (the object id) of each word of `shop_stock` in use (`shop_stock_count`) while `shop_mode` is
+    /// not 0; `None` with no shop open.
+    pub stock: Option<Vec<u8>>,
+    /// The page of the shop's list the screen shows from this work RAM ([`ShownPage`]); `None` when no shop's list
+    /// is up.
+    pub shown: Option<ShownPage>,
+    /// Whether the work RAM of the frame before showed the same `shown` ([`object_lists_after`]): the screen draws
+    /// a frame late, and a shop's list redraws within the frame after it changes, so a page is the one on the screen
+    /// only when it held two frames running. `false` when the frame before is not known ([`object_lists`]).
+    pub steady: bool,
+    /// The screen up (`menu_screen`) and the page number of its list (`map_entry_0d63`).
+    pub screen: Option<u8>,
+    pub page: Option<u8>,
+    /// For how many frames before this one, in a row, the screen, the page number and the bag have been what they are
+    /// now ([`object_lists_after`]); 0 when the frame before is not known ([`object_lists`]).
+    pub held: u32,
+    /// The screen, the page number and the bag as they last held long enough for the Item screen to show them
+    /// ([`settled`](Self::settled)), and how many times they have changed since (0 while settled): after one change
+    /// the screen shows either that page or the page they tell now, the rows of a page being redrawn together.
+    pub shown_screen: Option<u8>,
+    pub shown_page: Option<u8>,
+    pub shown_items: Vec<u8>,
+    pub changes: u32,
+}
+
+/// For how many frames the Item screen's state ([`ObjectLists::held`]) holds before the screen shows its page: the
+/// Item screen redraws its list after its page or the bag changes, measured 9 to 10 frames after a page turned and 12
+/// to 13 after a card dropped (in the field and in battle); this is twice the longest.
+pub const ITEM_SCREEN_SETTLE: u32 = 26;
+
+/// The value of `menu_screen` with the Item screen up (in the field and in battle).
+const ITEM_SCREEN: u8 = 2;
+
+/// The rows of a page of the Item screen's list.
+const ITEM_PAGE: usize = 8;
+
+impl ObjectLists {
+    /// The entry of the bag the first row of the Item screen's page shows, with the Item screen up and no shop's list
+    /// up: the page number times eight (a page has eight rows, one entry each, the `n`th showing entry `first + n`).
+    #[must_use]
+    pub fn item_page(&self) -> Option<usize> {
+        let page =
+            self.page.filter(|_| self.screen == Some(ITEM_SCREEN) && self.shown.is_none())?;
+        Some(usize::from(page) * ITEM_PAGE)
+    }
+
+    /// Whether the screen, its page number and the bag have held for [`ITEM_SCREEN_SETTLE`] frames: then the Item
+    /// screen shows the page they tell.
+    #[must_use]
+    pub fn settled(&self) -> bool {
+        self.held >= ITEM_SCREEN_SETTLE
+    }
+
+    /// The entry of the bag as it last settled (`shown_items`) that the first row of the Item screen's page showed
+    /// then, when the Item screen was up then and is up now and its state has changed once since: until the screen
+    /// redraws its list it still shows that page. `None` once settled again, after a second change, or with a shop's
+    /// list up.
+    #[must_use]
+    pub fn item_page_before(&self) -> Option<usize> {
+        let page = self.shown_page.filter(|_| {
+            self.changes == 1
+                && self.shown_screen == Some(ITEM_SCREEN)
+                && self.screen == Some(ITEM_SCREEN)
+                && self.shown.is_none()
+        })?;
+        Some(usize::from(page) * ITEM_PAGE)
+    }
+}
+
+/// The page of a shop's list up on the screen (`shop_stock`: what the shop sells, or the copy of the bag it buys
+/// from): the entry of the list its first place shows, and the objects of the whole list in order. A page has six
+/// places, two to a row along the rows first: the `n`th shows entry `first + n`, a place past the list is blank.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShownPage {
+    pub first: usize,
+    pub ids: Vec<u8>,
+}
+
+/// The lists of objects ([`ObjectLists`]) in the work RAM `wram` at the end of a frame. A count is taken as at most
+/// the entries its list has room for (24 in the bag, 32 in a shop); a list the work RAM is too short for is empty,
+/// and a shop mode it is too short for is no shop. The page shown is the shop's while `shop_mode` is $81 (its list
+/// up: buying, or selling from the copy of the bag), from the page number `map_entry_0d63` (six a page), and not
+/// `steady` nor `held` (the frame before is not known: [`object_lists_after`]). Nothing is written.
+#[must_use]
+pub fn object_lists(wram: &[u8]) -> ObjectLists {
+    let list = |start: u32, count: u32, room: u32| -> Vec<u8> {
+        let Some(count) = byte(wram, count) else { return Vec::new() };
+        (0..u32::from(count).min(room))
+            .map(|entry| byte(wram, start + 2 * entry))
+            .collect::<Option<Vec<u8>>>()
+            .unwrap_or_default()
+    };
+    let mode = byte(wram, d::SHOP_MODE);
+    let open = mode.is_some_and(|mode| mode != 0);
+    let stock = open.then(|| list(d::SHOP_STOCK, d::SHOP_STOCK_COUNT, d::SHOP_STOCK_SIZE / 2));
+    let page = byte(wram, d::MAP_ENTRY_0D63).map(usize::from);
+    let shown = match (page, stock.as_ref()) {
+        (Some(page), Some(stock)) if mode == Some(0x81) => {
+            Some(ShownPage { first: page * 6, ids: stock.clone() })
+        }
+        _ => None,
+    };
+    ObjectLists {
+        items: list(d::ITEM_LIST, d::ITEM_COUNT, d::ITEM_LIST_SIZE / 2),
+        stock,
+        shown,
+        steady: false,
+        screen: byte(wram, d::MENU_SCREEN),
+        page: byte(wram, d::MAP_ENTRY_0D63),
+        held: 0,
+        shown_screen: None,
+        shown_page: None,
+        shown_items: Vec::new(),
+        changes: 0,
+    }
+}
+
+/// The lists of objects in the work RAM `wram` at the end of a frame ([`object_lists`]), the lists `before` those of
+/// the frame before it: the page shown is `steady` when it is the page `before` showed (no list up in either is
+/// steady too), and the screen, its page number and the bag have `held` a frame longer than `before`'s when they are
+/// `before`'s (else 0). What they last settled as (`shown_screen`, `shown_page`, `shown_items`) is `before`'s until
+/// they settle again, and `changes` counts the times they changed since.
+#[must_use]
+pub fn object_lists_after(wram: &[u8], before: &ObjectLists) -> ObjectLists {
+    let mut lists = object_lists(wram);
+    lists.steady = lists.shown == before.shown;
+    let state = |lists: &ObjectLists| (lists.screen, lists.page, lists.items.clone());
+    let same = state(&lists) == state(before);
+    lists.held = if same { before.held.saturating_add(1) } else { 0 };
+    if lists.settled() {
+        lists.shown_screen = lists.screen;
+        lists.shown_page = lists.page;
+        lists.shown_items = lists.items.clone();
+        lists.changes = 0;
+    } else {
+        lists.shown_screen = before.shown_screen;
+        lists.shown_page = before.shown_page;
+        lists.shown_items.clone_from(&before.shown_items);
+        lists.changes = before.changes.saturating_add(u32::from(!same));
+    }
+    lists
 }
 
 /// The two words of a name spelled `word<XX>word` (one tile without a letter between two words of letters only,
@@ -1151,6 +1391,261 @@ mod tests {
             "two strings spelled alike, translated two ways: left out"
         );
         assert_eq!(names.len(), 1);
+    }
+
+    /// A ROM whose objects 16 and 17 point at one string `abc` and 24 and 25 at one string `dd` (as the English
+    /// patch has the two Scouters and the two Turtles), and whose objects 26 and 27 point at the string of
+    /// `string:5`, `cc`.
+    fn shared_objects_rom() -> Vec<u8> {
+        let object = |id: u32| d::OBJECT_NAME_POINTERS + 2 * id;
+        rom_with(&[
+            (object(16), &[0x00, 0x90]),
+            (object(17), &[0x00, 0x90]),
+            (object(24), &[0x10, 0x90]),
+            (object(25), &[0x10, 0x90]),
+            (d::STRING_POINTERS + 2 * 5, &[0x20, 0x90]),
+            (object(26), &[0x20, 0x90]),
+            (object(27), &[0x20, 0x90]),
+            (0x02_9000, &[3, 5, 7, 9]),
+            (0x02_9010, &[2, 0x0A, 0x0A]),
+            (0x02_9020, &[2, 9, 9]),
+        ])
+    }
+
+    #[test]
+    fn objects_sharing_a_string_translated_apart_are_named_by_id_not_by_spelling() {
+        let rom = shared_objects_rom();
+        let table = crate::translation::Translation::parse(
+            "key\tzh\nobject:16\t甲\nobject:17\t乙\nobject:24\t丙\nobject:25\t丁\n",
+        )
+        .unwrap();
+        let names = screen_names(&rom, &table);
+        assert_eq!(names.get("abc"), None, "no spelling stands for one of them: {names:?}");
+        assert_eq!(names.get("dd"), None, "{names:?}");
+        let objects = object_names(&rom, &table);
+        let by_id: HashMap<u8, String> = [(16, "甲"), (17, "乙"), (24, "丙"), (25, "丁")]
+            .map(|(id, zh)| (id, zh.to_owned()))
+            .into();
+        assert_eq!(objects.by_id, by_id);
+        assert_eq!(objects.spelled.get("abc"), Some(&vec![16, 17]));
+        assert_eq!(objects.spelled.get("dd"), Some(&vec![24, 25]));
+    }
+
+    #[test]
+    fn objects_sharing_a_string_translated_alike_stay_one_plain_name() {
+        let rom = shared_objects_rom();
+        let table = crate::translation::Translation::parse(
+            "key\tzh\nobject:16\t甲\nobject:17\t甲\nobject:24\t丙\nobject:25\t丁\n",
+        )
+        .unwrap();
+        let names = screen_names(&rom, &table);
+        assert_eq!(names.get("abc").map(String::as_str), Some("甲"), "{names:?}");
+        let by_id = object_names(&rom, &table).by_id;
+        assert!(!by_id.contains_key(&16) && !by_id.contains_key(&17), "{by_id:?}");
+        assert!(by_id.contains_key(&24) && by_id.contains_key(&25), "{by_id:?}");
+    }
+
+    #[test]
+    fn an_object_pointing_at_another_tables_string_is_not_named_by_id() {
+        // Objects 26 and 27 share the string of `string:5` and are translated apart from it and from each other: the
+        // string is `string:5`'s name on the screen, as Nail's is Chiaotzu's
+        let rom = shared_objects_rom();
+        let table = crate::translation::Translation::parse(
+            "key\tzh\nstring:5\t戊\nobject:26\t己\nobject:27\t庚\n",
+        )
+        .unwrap();
+        let by_id = object_names(&rom, &table).by_id;
+        assert!(!by_id.contains_key(&26) && !by_id.contains_key(&27), "{by_id:?}");
+        let names = screen_names(&rom, &table);
+        assert_eq!(names.get("cc").map(String::as_str), Some("戊"), "{names:?}");
+    }
+
+    #[test]
+    fn without_a_translation_of_the_objects_nothing_is_named_by_id() {
+        let rom = shared_objects_rom();
+        let table = crate::translation::Translation::parse("key\tzh\n").unwrap();
+        assert!(object_names(&rom, &table).by_id.is_empty());
+    }
+
+    #[test]
+    fn the_object_lists_are_the_bag_and_the_open_shops_stock() {
+        let mut wram = vec![0_u8; 0x20000];
+        wram[0x0100..][..6].copy_from_slice(&[0x10, 0x40, 0x11, 0x40, 0x18, 0x85]);
+        wram[0x01B2] = 3;
+        assert_eq!(
+            object_lists(&wram),
+            ObjectLists {
+                items: vec![16, 17, 24],
+                stock: None,
+                screen: Some(0),
+                page: Some(0),
+                ..ObjectLists::default()
+            }
+        );
+        wram[0x07AF] = 1;
+        wram[0x2220..][..4].copy_from_slice(&[0x10, 0x40, 0x11, 0x40]);
+        wram[0x2261] = 2;
+        assert_eq!(object_lists(&wram).stock, Some(vec![16, 17]));
+        wram[0x01B2] = 30;
+        assert_eq!(object_lists(&wram).items.len(), 24, "at most the 24 entries of the bag");
+        assert_eq!(object_lists(&[]), ObjectLists::default(), "a work RAM too short: empty lists");
+    }
+
+    /// A work RAM with the shop's stock `stock` (its count too) and the bag `items`, all else 0.
+    fn listing(stock: &[u8], items: &[u8]) -> Vec<u8> {
+        let mut wram = vec![0_u8; 0x20000];
+        for (entry, &id) in stock.iter().enumerate() {
+            wram[0x2220 + 2 * entry] = id;
+        }
+        wram[0x2261] = stock.len() as u8;
+        for (entry, &id) in items.iter().enumerate() {
+            wram[0x0100 + 2 * entry] = id;
+        }
+        wram[0x01B2] = items.len() as u8;
+        wram
+    }
+
+    #[test]
+    fn a_shop_list_up_is_shown_from_its_page_of_six() {
+        // The shop's list is up while `shop_mode` is $81; the page number (0 first) times six is its first entry
+        let stock = [0, 1, 2, 3, 4, 13, 7, 22, 16, 17, 9];
+        let mut wram = listing(&stock, &[24]);
+        wram[0x07AF] = 0x81;
+        wram[0x0D63] = 1;
+        let shown = ShownPage { first: 6, ids: stock.to_vec() };
+        assert_eq!(object_lists(&wram).shown, Some(shown.clone()));
+        wram[0x0D5F] = 2;
+        assert_eq!(
+            object_lists(&wram).shown,
+            Some(shown),
+            "the shop's list before the Item screen's"
+        );
+        for mode in [0x80, 0x01, 0x00] {
+            wram[0x07AF] = mode;
+            wram[0x0D5F] = 0;
+            assert_eq!(object_lists(&wram).shown, None, "shop mode {mode:#04x}: no list up");
+        }
+    }
+
+    #[test]
+    fn the_item_screen_shows_its_page_of_eight() {
+        // The Item screen (`menu_screen` 2) shows a page of eight rows, the page number (0 first) times eight its
+        // first entry
+        let mut wram = listing(&[], &[0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 24, 25]);
+        wram[0x0D5F] = 2;
+        wram[0x0D63] = 1;
+        let lists = object_lists(&wram);
+        assert_eq!(lists.shown, None, "no shop's list");
+        assert_eq!(lists.item_page(), Some(8));
+        wram[0x0D63] = 0;
+        assert_eq!(object_lists(&wram).item_page(), Some(0));
+        wram[0x0D5F] = 0x11;
+        assert_eq!(object_lists(&wram).item_page(), None, "another screen");
+        wram[0x0D5F] = 2;
+        wram[0x07AF] = 0x81;
+        assert_eq!(object_lists(&wram).item_page(), None, "the shop's list up");
+    }
+
+    #[test]
+    fn the_item_screen_settles_when_its_page_and_the_bag_hold() {
+        // The Item screen redraws its list some frames after its page number, the bag or the screen changes: its
+        // state settles when none of them has changed for `ITEM_SCREEN_SETTLE` frames running
+        let mut wram = listing(&[], &[0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 24, 25]);
+        wram[0x0D5F] = 2;
+        let hold = |wram: &[u8], from: &ObjectLists, frames: u32| {
+            (0..frames).fold(from.clone(), |before, _| object_lists_after(wram, &before))
+        };
+        let first = object_lists(&wram);
+        assert_eq!(first.held, 0, "no frame before");
+        assert!(!first.settled());
+        let almost = hold(&wram, &first, ITEM_SCREEN_SETTLE - 1);
+        assert_eq!(almost.held, ITEM_SCREEN_SETTLE - 1);
+        assert!(!almost.settled(), "a frame short");
+        let settled = hold(&wram, &almost, 1);
+        assert!(settled.settled(), "held long enough");
+        assert!(hold(&wram, &settled, 3).settled(), "and on");
+        let changed = |change: &dyn Fn(&mut Vec<u8>)| {
+            let mut wram = wram.clone();
+            change(&mut wram);
+            object_lists_after(&wram, &settled).held
+        };
+        assert_eq!(changed(&|wram| wram[0x0D63] = 1), 0, "the page number");
+        assert_eq!(changed(&|wram| wram[0x0100] = 9), 0, "an entry of the bag");
+        assert_eq!(changed(&|wram| wram[0x01B2] = 11), 0, "the bag's count");
+        assert_eq!(changed(&|wram| wram[0x0D5F] = 0), 0, "the screen");
+        assert_eq!(
+            changed(&|wram| wram[0x2220] = 9),
+            ITEM_SCREEN_SETTLE + 1,
+            "a shop's stock is not it"
+        );
+    }
+
+    #[test]
+    fn after_one_change_the_item_screen_still_tells_the_page_it_settled_on() {
+        // The Item screen redraws its list some frames after its state changes: until it settles again, and while
+        // the state has changed once only, the page it last settled on is told beside the new one
+        let bag = [0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 24, 25];
+        let mut wram = listing(&[], &bag);
+        wram[0x0D5F] = 2;
+        let hold = |wram: &[u8], from: &ObjectLists, frames: u32| {
+            (0..frames).fold(from.clone(), |before, _| object_lists_after(wram, &before))
+        };
+        let settled = hold(&wram, &object_lists(&wram), ITEM_SCREEN_SETTLE);
+        assert_eq!(settled.item_page_before(), None, "settled: the page now is the page shown");
+        assert_eq!((settled.changes, settled.shown_page), (0, Some(0)));
+        // The page turned
+        wram[0x0D63] = 1;
+        let turned = object_lists_after(&wram, &settled);
+        assert_eq!(turned.item_page(), Some(8));
+        assert_eq!(turned.item_page_before(), Some(0));
+        assert_eq!(turned.shown_items, bag);
+        let later = hold(&wram, &turned, ITEM_SCREEN_SETTLE - 1);
+        assert_eq!(later.item_page_before(), Some(0), "a frame short of settling");
+        let again = hold(&wram, &later, 1);
+        assert_eq!(
+            (again.item_page_before(), again.shown_page),
+            (None, Some(1)),
+            "settled on page 1"
+        );
+        // Turned back before it settled: two changes, neither page is told as the one shown
+        wram[0x0D63] = 0;
+        let back = object_lists_after(&wram, &turned);
+        assert_eq!((back.changes, back.item_page_before()), (2, None));
+        // A card dropped is one change too, the bag before it kept
+        wram[0x0D63] = 1;
+        let on_one = hold(&wram, &object_lists(&wram), ITEM_SCREEN_SETTLE);
+        wram[0x01B2] = 11;
+        let dropped = object_lists_after(&wram, &on_one);
+        assert_eq!(dropped.item_page_before(), Some(8));
+        assert_eq!((dropped.items.len(), dropped.shown_items.len()), (11, 12));
+        // Not with another screen up then or now, nor with a shop's list up
+        wram[0x0D5F] = 0x11;
+        assert_eq!(object_lists_after(&wram, &on_one).item_page_before(), None, "another screen");
+        let elsewhere = hold(&wram, &object_lists(&wram), ITEM_SCREEN_SETTLE);
+        wram[0x0D5F] = 2;
+        assert_eq!(object_lists_after(&wram, &elsewhere).item_page_before(), None, "just opened");
+    }
+
+    #[test]
+    fn a_page_is_steady_when_the_frame_before_showed_the_same() {
+        let mut wram = listing(&[16, 17], &[]);
+        wram[0x07AF] = 0x81;
+        let first = object_lists(&wram);
+        assert!(!first.steady, "no frame before: never steady");
+        let again = object_lists_after(&wram, &first);
+        assert!(again.steady, "the same page two frames running");
+        assert_eq!(again.shown, first.shown);
+        assert_eq!((again.items.clone(), again.stock.clone()), (first.items.clone(), first.stock));
+        wram[0x0D63] = 1;
+        assert!(!object_lists_after(&wram, &again).steady, "another page");
+        wram[0x0D63] = 0;
+        wram[0x2220] = 17;
+        assert!(!object_lists_after(&wram, &again).steady, "another entry");
+        wram[0x2220] = 16;
+        wram[0x07AF] = 0;
+        let closed = object_lists_after(&wram, &again);
+        assert!(!closed.steady, "the list closed");
+        assert!(object_lists_after(&wram, &closed).steady, "no list two frames running");
     }
 
     #[test]

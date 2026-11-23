@@ -4,9 +4,9 @@
 
 Author: Ming Liu (GitHub: [lming888](https://github.com/lming888))
 
-**Download**: [the RC3 installer and the Android APK](https://github.com/lming888/DBZ-SSD-zhTW/releases/tag/rc3)
+**Download**: [the v1.0 installer and the Android APK](https://github.com/lming888/DBZ-SSD-zhTW/releases/tag/v1.0)
 
-**Status**: RC3, a release candidate. Nobody has played it through from start to end on Windows yet; reports from playing it are welcome.
+**Status**: v1.0 (the official release). Reports from playing it are welcome.
 
 ![The Chinese text in a story dialogue](docs/media/zh-tw-dialogue.png)
 ![The Chinese text in a battle message](docs/media/zh-tw-battle.png)
@@ -34,7 +34,7 @@ Any of the three ROMs works (the Japanese one together with `dbz102.ips`). On Wi
 
 ### Method 1: the release (recommended)
 
-The RC3 Release provides the installer `DBZ-SSD-zh-TW-RC3-setup.exe` (attached to the Release page):
+The v1.0 Release provides the installer `DBZ-SSD-zh-TW-v1.0-setup.exe` (attached to the Release page):
 
 - **Installer**:
   - Installs for the current user only, without administrator rights.
@@ -42,7 +42,7 @@ The RC3 Release provides the installer `DBZ-SSD-zh-TW-RC3-setup.exe` (attached t
   - Lets you pick your own ROM and IPS on the way; skip it and the launcher asks the first time.
   - After the ROM, a page "HD 高畫質美術包" (the HD art pack): on the left the original and the HD picture of the same game frame, one above the other; on the right a note that the art pack is the upstream author's work, about 462 MB. Tick "download the HD art pack after setup" (off by default) to download it when setup finishes; when the install folder already has the pack, the page only tells you so and does not ask. The finish page has "start the game"; when both are ticked, the pack is downloaded first and the game starts after the download.
   - Makes a desktop shortcut "七龍珠Z 超賽亞傳說 繁中版" and a Start menu folder "七龍珠Z 超賽亞傳說 繁中版" with the game and "下載 HD 美術包" (download the HD art pack).
-  - **RC1 or RC2 already installed**: just run the newer installer; it upgrades in place, with no need to uninstall first. Keep the install folder it offers (the last one, the default): the program is replaced, the saves, the ROM setup, the HD art pack, the game settings and the language are kept, and "Add or remove programs" and the shortcuts still list one copy. The installer's first page says it found the installed RC2 and will upgrade it in place to RC3. The launchers of RC1 and RC2 do not look for a newer version themselves: download and run the new installer once. With RC1 and RC2 installed in two different folders, the new version upgrades the one installed last (the one "Add or remove programs" points at). Installing into another folder leaves the old folder's program and saves where they are (the saves are not moved over) and points "Add or remove programs" at the new folder; remove the old copy, when you no longer want it, by running `uninstall-dbz-zhtw.exe` in the old folder (the saves are kept by default).
+  - **RC1, RC2 or RC3 already installed**: just run the newer installer; it upgrades in place, with no need to uninstall first. Keep the install folder it offers (the last one, the default): the program is replaced, the saves, the ROM setup, the HD art pack, the game settings and the language are kept, and "Add or remove programs" and the shortcuts still list one copy. The installer's first page says it found the installed RC3 and will upgrade it in place to v1.0. The launchers of RC1 to RC3 do not look for a newer version themselves: download and run the new installer once. With RC1 and RC2 installed in two different folders, the new version upgrades the one installed last (the one "Add or remove programs" points at). Installing into another folder leaves the old folder's program and saves where they are (the saves are not moved over) and points "Add or remove programs" at the new folder; remove the old copy, when you no longer want it, by running `uninstall-dbz-zhtw.exe` in the old folder (the saves are kept by default).
   - Can be removed in "Add or remove programs". By default the saves and the HD art pack are kept; to delete them too, tick "同時刪除存檔、ROM 設定、HD 美術包與遊戲設定" (also delete the saves, the ROM setup, the HD art pack and the game settings).
   - Has no code-signing certificate: the first time it runs, Windows SmartScreen says "Windows protected your PC"; click "More info", then "Run anyway".
 
@@ -97,7 +97,7 @@ The difference between the two methods: method 2 does not have the fixes I wrote
 ### Android version
 
 1. You need an arm64 (64-bit ARM) phone or tablet with Android 8.0 or later, and the same ROM as in "What you need" above.
-2. Download `DBZ-SSD-zh-TW-RC3-arm64.apk` from the Release and open it on the phone to install it. If this project's RC1, RC2 or a test build is installed, just install over it: the saves and settings are kept. The APK is not in a store, so at the first install the system asks you to let that source "install unknown apps".
+2. Download `DBZ-SSD-zh-TW-v1.0-arm64.apk` from the Release and open it on the phone to install it. If an earlier version of this project or a test build is installed, just install over it: the saves and settings are kept. The APK is not in a store, so at the first install the system asks you to let that source "install unknown apps".
 3. At the first start the language page comes first (Taiwan, Hong Kong); then pick the ROM with the system's file picker. With the Japanese ROM it then asks for `dbz102.ips`.
 4. (Optional) the HD art pack: download `hd-pack.zip` to the phone first, then pick it with the file picker from 「安裝 HD 美術包」 (Install the HD pack) in the options (about 0.9 GB once installed).
 
@@ -152,6 +152,7 @@ The game screens
 - The wording of the HD menus (options, save editor and so on) was checked row by row against the program in this version; the rows still marked as to be reviewed are ones where the style of wording could be reconsidered, not missing translations.
 - The language page of the first start is in Chinese; only the two letters "HD" on it are English.
 - In the Hong Kong version, the big character on the cards and the square seal on the left of the status screen are still the single character 「神」: they are pictures, and this version changes only the school mark beside them to 「天神」.
+- For about half a second after the item list (on the map and in battle) is opened, turned to a new page, or has a card dropped from it, the two Scouters are shown as 「探測器」 and the Frog and Turtle cards as the English `Turtle`, and then change to their own names; on a last page that is not full, the rows of the page before left below it are shown the same way. This does not affect play.
 - If the settings file `save\saves\ssd.settings` is changed to an encoding other than UTF-8, the language page may appear at every start.
 - The changes brought in by upstream v0.3.14 and v0.3.15 (a button leaves GAME OVER for the title, the "Pixel" look, the level cap, the "HD art" switch) have not been fully seen on the Chinese screens.
 - After losing a battle and leaving the GAME OVER screen, "Continue" brings the cheats and the game options back to the settings of that save (as "Continue" after starting the game does).
@@ -159,13 +160,14 @@ The game screens
 - Up to RC2, "Continue" after GAME OVER lost cards (one of each stack; the single Gohan card disappeared). RC3 fixes it, but a save written after a card was lost does not get it back; add it again with 「卡牌產生器」 (Item spawner) on the 「作弊」 (Cheats) screen of the menu (it marks the save with the CHEATS badge).
 
 Android
-- Some older Android devices close right after starting. RC3 shows a dialog with the reason and switches to OpenGL ES after a start that drew no picture, but this has not been checked on a device that has the problem; if it happens, please paste the dialog's text into the report.
+- v1.0 fixes the crash right after starting when the system refuses the Performance Hint (confirmed by a player on a real device). If it still closes right after starting, please paste the dialog's text into the report.
 
 Installing and starting
 - The installer has not been seen on a real machine at 125%-200% scaling or on Windows without the PMingLiU font; when text is cut off, please report it (with a screenshot and the scaling setting).
 - Downloading the art pack from the copy when upstream cannot deliver it has not been run with a real loss of connection.
-- The launchers of RC1 and RC2 do not look for a newer version: download and run the new installer (on Android, install the APK over the old one). With RC1 and RC2 installed in two folders, the new version upgrades the one installed last; the other stays where it is: run `uninstall-dbz-zhtw.exe` there when you no longer want it.
-- Nobody has played it through on a real Windows machine yet. When reporting a problem, attach `last-run.log`, an F12 screenshot and where it happened (story part or map).
+- The launchers of RC1 to RC3 do not look for a newer version: download and run the new installer (on Android, install the APK over the old one). With RC1 and RC2 installed in two folders, the new version upgrades the one installed last; the other stays where it is: run `uninstall-dbz-zhtw.exe` there when you no longer want it.
+- When reporting a problem, attach `last-run.log`, an F12 screenshot and where it happened (story part or map).
+- On a Steam Deck running Windows 11, the game does not pick up the built-in controls; install [SWICD](https://github.com/mKenfenheuer/steam-deck-windows-usermode-driver) (it turns the built-in controls into a virtual Xbox 360 controller) and they work. That project is archived; its README says it is replaced by [steamdeck-kernel-driver](https://github.com/mKenfenheuer/steamdeck-kernel-driver), which has not been tested.
 
 ## Translation basis
 

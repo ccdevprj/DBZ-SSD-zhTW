@@ -423,6 +423,23 @@ objects 9 to 13 (card changers) and 15 (Porunga) stack by their word: a unit joi
 unit whose word changes (a wish used, a card choice) leaves its stack; the keeper takes that unit off its stack and adds it with the new word.
 Dragon Balls (33 to 39) and the story objects (attribute bit 5) are key items: listed first, never dropped.
 
+**Objects the story looks for.** The story searches `$0100` itself for seven objects that are not key items, so a
+unit outside the projection is a unit it does not see (`STORY_CHECKED` in `ssd-menus::bag`): Lunch 0x09 (`03:9D64`
+sets a flag when the party has one, `01:D812` takes it), both Scouters 0x10 and 0x11 (the Namek elder's trade,
+effect `0x64` at `03:D11F`, needs both through `01:C6AE` and takes one of each through `01:C69B`), Vegeta 0x13
+(`03:C001` takes him), the "Moon" card 0x14 (`01:DB9D` after the duel with Vegeta, `05:8538` through `1D:8A85` in
+battle), the Dragon Radar 0x17 (`03:D28E` and `03:EC99` through `01:C6AE`) and the Namek frog card 0x18
+(`05:A30B` through `1D:8A85` in battle). The projection chooses its entries before it orders them: the key items,
+the first stack of each of the seven, and the entries left for the other stacks in the order they were acquired;
+the chosen stacks are then listed as before (the staged stack, the key items, the rest in acquisition order). A bag
+the list shows whole is listed exactly as it was, and a longer one swaps the seven in for its latest other stacks.
+They take at most seven entries; with the nine key items (seven Dragon Balls, Gohan 0x1A, the Namek frog 0x20) and
+the staged stack that is 17, below 21. What a list of objects does not cover: the healing objects as a class
+(`E019`, message `0x0C2`, asks for any of 0x00 to 0x04, 0x08, 0x0E, 0x0F and offers only the ones in the list), the
+NPC of `03:A1C2` that takes the first droppable entry (removed by `01:D9E9`; the order is kept, so it is the
+earliest droppable stack, as in Classic), the battle removal of the last entry (`1D:8BC6`), and the shop's Sell list,
+which is a copy of the list (`01:D631`, `03:A8A5`), so a stack outside the projection cannot be sold.
+
 **The original's Use, from the Item list (seen with `menu-test items`).** Choose the entry (A on the list, the
 Use/Drop window is step 2). A window takes its next press only after it has settled: a press in the first
 frames after it is drawn is lost, so the plan waits about two seconds. Use (cursor 0) then shows either the

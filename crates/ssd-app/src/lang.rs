@@ -415,7 +415,8 @@ pub fn overlay(language: Language, rom: &[u8]) -> Option<Arc<Overlay>> {
         }
     })?;
     let names = ssd_catalogue::engine::screen_names(rom, &table);
-    Some(Arc::new(Overlay::new(table, face).with_names(names)))
+    let objects = ssd_catalogue::engine::object_names(rom, &table);
+    Some(Arc::new(Overlay::new(table, face).with_names(names).with_objects(objects)))
 }
 
 /// The tests that set the process-wide override (or depend on it) hold this lock.

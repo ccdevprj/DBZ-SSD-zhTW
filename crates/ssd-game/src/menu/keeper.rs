@@ -912,6 +912,103 @@ mod tests {
         assert_eq!(read_list(&ram), [(2, 0)], "and the list does not show it");
     }
 
+    /// The objects of the list in work RAM.
+    fn list_objects(ram: &[u8]) -> Vec<u8> {
+        read_list(ram).iter().map(|&(object, _)| object).collect()
+    }
+
+    /// The story searches the original's list for objects that are not key items: the Namek elder's trade (effect
+    /// `0x64`, `03:D11F`) searches `$0100` for both Scouters, 16 and 17, with `01:C6AE`, and gives nothing unless both
+    /// are there. A bag whose Scouters came after twenty other stacks still shows both in the list the original
+    /// searches.
+    #[test]
+    fn the_scouters_the_elder_asks_for_are_in_the_list_after_twenty_other_stacks() {
+        let labels = Labels::default();
+        let sidecar = Sidecar::empty();
+        // Twenty stacks the party had before: nineteen objects and the 4-star Dragon Ball (a key item, listed first).
+        let before: Vec<u8> = (0..=14).chain([18, 20, 21, 22, 36]).collect();
+        let mut ram = wram_with(&before, 0);
+        let mut keeper = Keeper::new(Rules::default());
+        let events = keeper.bind(&ram, &labels, None, &sidecar, true);
+        apply(&mut ram, &events);
+        // Battle drops: two Scouters of each kind, added at the end of the list by the original.
+        let mut now = list_objects(&ram);
+        now.extend([16, 16, 17, 17]);
+        let mut dropped = wram_with(&now, 0);
+        dropped[d::ITEM_EXTRA as usize - 0x7E_0000..][..0x40]
+            .copy_from_slice(&ram[d::ITEM_EXTRA as usize - 0x7E_0000..][..0x40]);
+        let events = keeper.sync(&dropped, &labels, None, &sidecar);
+        apply(&mut dropped, &events);
+        let bag = keeper.bag().unwrap();
+        assert_eq!((bag.units_of(16), bag.units_of(17)), (2, 2), "the bag holds both Scouters");
+        let listed = list_objects(&dropped);
+        assert!(
+            listed.contains(&16) && listed.contains(&17),
+            "01:C6AE searches the list for 16 and 17: {listed:?}"
+        );
+    }
+
+    #[test]
+    fn a_row_removed_after_a_story_object_was_added_takes_a_unit_of_its_own_stack() {
+        let labels = Labels::default();
+        let sidecar = Sidecar::empty();
+        let mut ram = wram_with(&[2, 5, 6], 0);
+        let mut keeper = Keeper::new(Rules::default());
+        let events = keeper.bind(&ram, &labels, None, &sidecar, true);
+        apply(&mut ram, &events);
+        // The original adds a Scouter at the end of the list.
+        let mut ram = wram_with(&[2, 5, 6, 16], 0);
+        let events = keeper.sync(&ram, &labels, None, &sidecar);
+        apply(&mut ram, &events);
+        assert_eq!(list_objects(&ram), [2, 5, 6, 16], "a bag of four stacks keeps its order");
+        // The original removes the row of 5 and compacts the list.
+        let mut ram = wram_with(&[2, 6, 16], 0);
+        let events = keeper.sync(&ram, &labels, None, &sidecar);
+        apply(&mut ram, &events);
+        let bag = keeper.bag().unwrap();
+        assert_eq!(bag.units_of(5), 0, "the removed row was the unit of 5");
+        assert_eq!((bag.units_of(2), bag.units_of(6), bag.units_of(16)), (1, 1, 1));
+    }
+
+    /// The keeper records the stack of every row it writes, so a row the original removes takes its unit from that
+    /// stack wherever the projection put it. Here the Scouters are swapped into the rows that the latest other stack
+    /// (28) had, and the elder's trade takes one Scouter (`03:D137`, `01:C69B`): the Scouter stack loses its unit, and
+    /// the stack that left the list keeps its own.
+    #[test]
+    fn a_story_object_swapped_into_the_list_is_taken_from_its_own_stack() {
+        let labels = Labels::default();
+        let sidecar = Sidecar::empty();
+        let before: Vec<u8> = (0..=8).chain(10..=14).chain([18, 21, 22, 25, 27, 28]).collect();
+        let mut ram = wram_with(&before, 0);
+        let mut keeper = Keeper::new(Rules::default());
+        let events = keeper.bind(&ram, &labels, None, &sidecar, true);
+        apply(&mut ram, &events);
+        assert_eq!(list_objects(&ram), before);
+        // Battle drops: two Scouters of 10 points and one of 20, at the end of the list.
+        let mut now = before.clone();
+        now.extend([16, 16, 17]);
+        let mut ram = wram_with(&now, 0);
+        let events = keeper.sync(&ram, &labels, None, &sidecar);
+        apply(&mut ram, &events);
+        let mut shown = before[..19].to_vec();
+        shown.extend([16, 17]);
+        assert_eq!(list_objects(&ram), shown, "28 leaves the list to the Scouters");
+        // The trade takes the row of 16 (row 19, where 28 was before) and the original compacts the list.
+        let mut taken = shown.clone();
+        taken.remove(19);
+        let mut ram = wram_with(&taken, 0);
+        let events = keeper.sync(&ram, &labels, None, &sidecar);
+        apply(&mut ram, &events);
+        let bag = keeper.bag().unwrap();
+        assert_eq!(bag.units_of(16), 1, "one unit left the Scouter stack");
+        assert_eq!(bag.units_of(17), 1);
+        for &object in &before {
+            assert_eq!(bag.units_of(object), 1, "{object} keeps its unit");
+        }
+        assert_eq!(bag.units(), 22);
+        assert_eq!(list_objects(&ram), shown, "the Scouter left in the bag is listed again");
+    }
+
     /// Sets the state word of list entry `index` in work RAM.
     fn set_extra(ram: &mut [u8], index: usize, extra: u16) {
         let at = EXTRA as usize - 0x7E_0000 + 2 * index;

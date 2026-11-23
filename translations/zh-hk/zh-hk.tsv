@@ -1398,15 +1398,15 @@ object:12	芝芝	names_objects:12
 object:13	八戒	names_objects:13
 object:14	神龍	names_objects:14
 object:15	布魯吉	names_objects:15
-object:16	探測器	names_objects:16 override
-object:17	探測器	names_objects:17 override
+object:16	紅探測器	names_objects:16 override
+object:17	綠探測器	names_objects:17 override
 object:18	彌太郎	names_objects:18
 object:19	比達	names_objects:19
 object:20	尾巴月亮	names_objects:20
 object:21	阿布	names_objects:21
 object:22	舞空術	names_objects:22
 object:23	龍珠雷達	names_objects:23
-object:24	海龜	names_objects:24 override
+object:24	青蛙	names_objects:24
 object:25	海龜	names_objects:25
 object:26	悟飯	names_objects:26
 object:27	蘭芝	names_objects:27
