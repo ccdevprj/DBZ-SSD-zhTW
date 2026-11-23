@@ -22,7 +22,8 @@ use crate::font::TextCell;
 use ab_glyph::{Font as _, FontVec, PxScale, point};
 use rustc_hash::{FxHashMap, FxHashSet};
 use ssd_catalogue::engine::{
-    ENDING_TABLE, INTRO_LINES, INTRO_TABLE, OnScreen, intro_key, intro_line_top,
+    ENDING_TABLE, INTRO_LINES, INTRO_TABLE, ObjectLists, ObjectNames, OnScreen, intro_key,
+    intro_line_top,
 };
 use ssd_catalogue::translation::{Slot, Translation, render};
 use ssd_oracle::{Color, FrameLog};
@@ -161,12 +162,30 @@ pub struct Overlay {
     /// for each part of the screen (a screen of the font's tiles while the Continue loads has thousands of parts).
     filling: Vec<(String, String)>,
     sorted: Vec<(String, String)>,
+    /// The objects' names as the screen spells them, and those named by id: a spelling objects share and the
+    /// translation names apart is none of `names`, and a row spelling it takes the name of the object the lists of
+    /// the frame show there ([`place_objects`]).
+    objects: ObjectNames,
+    /// The spelling of each object `objects` spells (made once by [`Overlay::with_objects`]).
+    spelling: FxHashMap<u8, String>,
+    /// The name each spelling objects share and the translation names apart has when no list tells the objects:
+    /// the end their names share, two characters or more (the two Scouters' `探測器`).
+    alike: FxHashMap<String, String>,
 }
 
 impl Overlay {
     #[must_use]
     pub fn new(table: Arc<Translation>, face: Arc<ChineseFace>) -> Self {
-        Self { table, face, names: HashMap::new(), filling: Vec::new(), sorted: Vec::new() }
+        Self {
+            table,
+            face,
+            names: HashMap::new(),
+            filling: Vec::new(),
+            sorted: Vec::new(),
+            objects: ObjectNames::default(),
+            spelling: FxHashMap::default(),
+            alike: FxHashMap::default(),
+        }
     }
 
     /// The translation of the name `english` spells on screen: the name, or the one name it is the start of
@@ -211,6 +230,44 @@ impl Overlay {
             names.iter().map(|(name, translation)| (name.clone(), translation.clone())).collect();
         self.sorted.sort_unstable();
         self.names = names;
+        self
+    }
+
+    /// The overlay naming the rows that spell a name objects share by the object each row is
+    /// (`ssd_catalogue::engine::object_names`), from the lists of objects of each frame ([`Translator::objects`]).
+    #[must_use]
+    pub fn with_objects(mut self, objects: ObjectNames) -> Self {
+        self.spelling = objects
+            .spelled
+            .iter()
+            .flat_map(|(spelling, ids)| ids.iter().map(move |&id| (id, spelling.clone())))
+            .collect();
+        self.alike = objects
+            .spelled
+            .iter()
+            .filter_map(|(spelling, ids)| {
+                let names: Vec<&String> =
+                    ids.iter().filter_map(|id| objects.by_id.get(id)).collect();
+                if names.len() < 2 || names.len() < ids.len() {
+                    return None;
+                }
+                let mut ends: Vec<std::iter::Rev<std::str::Chars<'_>>> =
+                    names.iter().map(|name| name.chars().rev()).collect();
+                let mut shared: Vec<char> = Vec::new();
+                'end: loop {
+                    let mut letters = ends.iter_mut().map(Iterator::next);
+                    let Some(Some(first)) = letters.next() else { break };
+                    for letter in letters {
+                        if letter != Some(first) {
+                            break 'end;
+                        }
+                    }
+                    shared.push(first);
+                }
+                (shared.len() >= 2).then(|| (spelling.clone(), shared.iter().rev().collect()))
+            })
+            .collect();
+        self.objects = objects;
         self
     }
 
@@ -764,6 +821,11 @@ struct Painted {
 pub(crate) struct Translator {
     pub overlay: Arc<Overlay>,
     pub screen: Option<OnScreen>,
+    /// The lists of objects in the work RAM at the start of the frame being drawn (the bag's, and the open shop's
+    /// stock, the page of the shop's list shown and whether it held since the frame before), which tell apart the
+    /// rows spelling a name objects share ([`place_objects`]). Empty and not steady when nothing reads them: the rows
+    /// then keep their English.
+    pub objects: ObjectLists,
     kept: Kept,
     /// The page of another window still up under the one the engine names now ([`draw_pages`]).
     behind: Option<Kept>,
@@ -771,7 +833,13 @@ pub(crate) struct Translator {
 
 impl Translator {
     pub(crate) fn new(overlay: Arc<Overlay>) -> Self {
-        Self { overlay, screen: None, kept: Kept::default(), behind: None }
+        Self {
+            overlay,
+            screen: None,
+            objects: ObjectLists::default(),
+            kept: Kept::default(),
+            behind: None,
+        }
     }
 
     /// The text cells of the frame the HD font draws, when not all of `cells`: in the intro, all but the letters of
@@ -845,7 +913,7 @@ impl Translator {
         }
     }
 
-    /// Draws the frame's translation: the names written into the tile maps ([`draw_names`]), the chase's damage
+    /// Draws the frame's translation: the names written into the tile maps ([`draw_names_listed`]), the chase's damage
     /// label of the tile maps of `log` ([`draw_chase_damage`]), then the intro's lines ([`draw_intro`]) or the
     /// message engine's page ([`draw`]). `character` spells a glyph of the cells.
     #[allow(clippy::too_many_arguments)]
@@ -863,7 +931,16 @@ impl Translator {
         let rows = tile_rows(log);
         // (the original's `▼`, as the picture shows it before anything is drawn over it: [`continue_mark`])
         let marks = mark_cells(&rows, window_x, target);
-        draw_names(&self.overlay, target, cells, &frame.pixels, frame.width, character);
+        draw_names_listed(
+            &self.overlay,
+            target,
+            cells,
+            &frame.pixels,
+            frame.width,
+            character,
+            &self.objects,
+            window_x,
+        );
         draw_rules(target, cells, character);
         if self.overlay.table.text(CHASE_DAMAGE_KEY).is_some() {
             draw_chase_damage(&self.overlay, target, cells, &rows, window_x);
@@ -2021,7 +2098,9 @@ fn fills(name: &str, english: &str) -> bool {
 /// Draws, over each part of `cells` (spelled by `character`, see [`name_parts`]) that is a name of the overlay's,
 /// its translation: the part's cells take their ground colour and the name is drawn across them in their ink, its
 /// em shrunk to fit the part. The letters of names whose first letter is cut take their ground, round their cells
-/// where the 1x frame `frame` (`frame_width` pixels a row) is that ground ([`draw_covered_column`]).
+/// where the 1x frame `frame` (`frame_width` pixels a row) is that ground ([`draw_covered_column`]). No list of
+/// objects tells a row spelling a name objects share: those rows keep their English ([`draw_names_listed`]).
+#[cfg(test)]
 fn draw_names(
     overlay: &Overlay,
     target: &mut Target<'_>,
@@ -2030,19 +2109,52 @@ fn draw_names(
     frame_width: usize,
     character: &dyn Fn(u8) -> Option<char>,
 ) {
+    draw_names_listed(
+        overlay,
+        target,
+        cells,
+        frame,
+        frame_width,
+        character,
+        &ObjectLists::default(),
+        0,
+    );
+}
+
+/// Draws the names of `cells` as `draw_names` does, a row that spells a name objects share and translates apart
+/// taking the name of the object the lists `lists` show on it ([`place_objects`], the original's window at
+/// `window_x`); a row they do not tell keeps its English: no row is drawn as another object's name.
+#[allow(clippy::too_many_arguments)]
+fn draw_names_listed(
+    overlay: &Overlay,
+    target: &mut Target<'_>,
+    cells: &[TextCell],
+    frame: &[Color],
+    frame_width: usize,
+    character: &dyn Fn(u8) -> Option<char>,
+    lists: &ObjectLists,
+    window_x: i32,
+) {
     if overlay.names.is_empty() {
         return;
     }
     let mut unnamed = Vec::new();
     let parts = name_parts(cells, character);
     let commands = battle_commands(&parts);
+    let placed = place_objects(overlay, &parts, cells, character, lists, window_x);
     // (the places of the parts that are names, gathered once when a part needs them: see `hide_cut_words`)
     let named_starts = std::cell::OnceCell::new();
     for (english, part) in parts {
-        if let Some(name) = overlay.name(english.trim_end()) {
+        // A row spelling a shared name whole: the name of its object, drawn as a name by spelling is. A row whose
+        // first letter the cursor cuts is drawn with its list's cut rows (`draw_covered_column`)
+        let by_id = part
+            .first()
+            .and_then(|first| placed.get(&(first.x, first.y)).copied())
+            .filter(|_| overlay.objects.spelled.contains_key(english.trim_end()));
+        if let Some(name) = by_id.or_else(|| overlay.name(english.trim_end())) {
             // (a row of words or figures set in columns, `1 2 3 4 5` of the text speed, keeps to its cells; so does a
             // name found by its start, which may be a name being written into the blanks after it)
-            let whole = overlay.names.contains_key(english.trim_end());
+            let whole = by_id.is_some() || overlay.names.contains_key(english.trim_end());
             let room = if !whole || english.trim().contains(' ') {
                 0
             } else {
@@ -2205,8 +2317,312 @@ fn draw_names(
             target.lift_cell((x - 8, y + PITCH * row), COMMAND_LIFT, paper);
         }
     }
-    draw_covered_column(overlay, target, cells, frame, frame_width, character, &unnamed);
+    draw_covered_column(overlay, target, cells, frame, frame_width, character, &unnamed, &placed);
     hide_cut_words(overlay, target, cells, character, &unnamed);
+}
+
+/// Where the places of a page of a shop's list are from its first place's (the first letter of the name of the
+/// page's first entry): six, two to a row along the rows first, the right column nine cells right of the left, rows
+/// two cells apart (the shop's place table at `01:B317`: tile columns 8 and 17, tile rows 4, 6 and 8).
+const SHOP_PLACES: [(i32, i32); 6] = [(0, 0), (72, 0), (0, 16), (72, 16), (0, 32), (72, 32)];
+
+/// The cells a place of a shop's page has for a name: a place past the list has no letter in them.
+const PLACE_ROOM: i32 = 9;
+
+/// Where the first letter of the name on the first row of the Item screen's list is, from the left of the original's
+/// window, in the field and in battle alike (the list is on the text layer, which does not scroll); its eight rows
+/// are one column, [`ITEM_ROW_PITCH`] apart.
+const ITEM_FIRST_ROW: (i32, i32) = (32, 31);
+const ITEM_ROW_PITCH: i32 = 16;
+const ITEM_ROWS: i32 = 8;
+
+/// The names of the rows of the screen that spell a name objects share and the overlay translates apart
+/// ([`ObjectNames::by_id`]), by the place of each row's first letter: nothing unless the lists `lists` are `steady`
+/// (the screen draws a frame late, so a list that just changed may not be the one it shows: those rows keep their
+/// English). Then
+/// - with a page of a shop's list up ([`ObjectLists::shown`]), the name of each place's entry, when the screen
+///   spells the whole page as its entries are spelled ([`place_on_page`]);
+/// - with the Item screen up (in the field and in battle), once [`settled`](ObjectLists::settled) the name of each
+///   row's entry, when each row of the page's entries spells its entry where that row is (the window at
+///   `window_x`: [`place_item_rows`]); any other row there (the rows below a short page, still the page before's; a
+///   row before the screen settles) only takes the name the objects of its spelling share, never one by what the bag
+///   holds;
+/// - else the name the objects of the row's spelling share, or the name of the one of them the bag holds
+///   ([`place_alike`]).
+///
+/// A row neither tells keeps its English rather than show another object's name.
+fn place_objects<'a>(
+    overlay: &'a Overlay,
+    parts: &[(String, Vec<&TextCell>)],
+    cells: &[TextCell],
+    character: &dyn Fn(u8) -> Option<char>,
+    lists: &ObjectLists,
+    window_x: i32,
+) -> FxHashMap<(i32, i32), &'a str> {
+    let mut placed = FxHashMap::default();
+    if overlay.objects.by_id.is_empty() || !lists.steady {
+        return placed;
+    }
+    match (&lists.shown, lists.item_page()) {
+        (Some(page), _) => {
+            let ids = page.ids.get(page.first..).unwrap_or_default();
+            place_on_page(overlay, cells, character, &SHOP_PLACES, ids, &mut placed);
+        }
+        (None, Some(first)) => {
+            let now = lists.items.get(first..).unwrap_or_default();
+            let letters = letters_at(cells, character);
+            if lists.settled() {
+                place_item_rows(overlay, &letters, window_x, now, &mut placed);
+            } else if let Some(before) = lists.item_page_before() {
+                // (the state changed once: the screen shows the page it settled on until it redraws, then the
+                // page told now. The rows are the page before's when they spell it and one of them is seen not to
+                // be the page now's)
+                let before = lists.shown_items.get(before..).unwrap_or_default();
+                if not_the_page(overlay, &letters, window_x, before, now) {
+                    place_item_rows(overlay, &letters, window_x, before, &mut placed);
+                }
+            }
+            place_alike(overlay, parts, lists, false, &mut placed);
+        }
+        (None, None) => place_alike(overlay, parts, lists, true, &mut placed),
+    }
+    placed
+}
+
+/// Adds to `placed` the name of each entry of the Item screen's page that a spelling objects share is, when the
+/// screen (`cells`, spelled by `character`, the original's window at `window_x`) shows that page: row `n` of the
+/// list, at its own place ([`ITEM_FIRST_ROW`], [`ITEM_ROW_PITCH`] a row), spells entry `n` of `ids` (the bag from the
+/// page's first entry), for every row the page has an entry for. The rows are looked at where they are, not looked
+/// for: a row below a short page (the page before's, left on the screen) is none of the page's, and with a row of
+/// the page covered (a window over the list) or not spelled as its entry, or an entry with no spelling to check,
+/// nothing is added.
+fn place_item_rows<'a>(
+    overlay: &'a Overlay,
+    letters: &FxHashMap<(i32, i32), char>,
+    window_x: i32,
+    ids: &[u8],
+    placed: &mut FxHashMap<(i32, i32), &'a str>,
+) {
+    let x = window_x + ITEM_FIRST_ROW.0;
+    for (y, id) in item_rows(overlay, letters, window_x, ids).unwrap_or_default() {
+        if let Some(name) = overlay.objects.by_id.get(&id) {
+            placed.insert((x, y), name.as_str());
+        }
+    }
+}
+
+/// The rows of the Item screen's list (each row's y and its entry) when the screen's `letters` (the original's
+/// window at `window_x`) show the page whose entries are `ids`: every row the page has an entry for spells that
+/// entry where the row is ([`row_spells`]). `None` when a row does not, or an entry has no spelling to check; a page
+/// with no entry shows no row.
+fn item_rows(
+    overlay: &Overlay,
+    letters: &FxHashMap<(i32, i32), char>,
+    window_x: i32,
+    ids: &[u8],
+) -> Option<Vec<(i32, u8)>> {
+    let x = window_x + ITEM_FIRST_ROW.0;
+    (0..ITEM_ROWS)
+        .zip(ids)
+        .map(|(row, &id)| {
+            let y = ITEM_FIRST_ROW.1 + ITEM_ROW_PITCH * row;
+            row_spells(letters, (x, y), overlay.spelling.get(&id)?).then_some((y, id))
+        })
+        .collect()
+}
+
+/// Whether a row of the Item screen's list shows that the screen's `letters` are not the page whose entries are
+/// `now`, of the two pages `before` and `now`: a row both pages have an entry for, both entries with a spelling to
+/// check, that spells `before`'s entry and not `now`'s. A page whose rows cannot be checked (an entry with no
+/// spelling, a row covered) is not shown to be absent by that.
+fn not_the_page(
+    overlay: &Overlay,
+    letters: &FxHashMap<(i32, i32), char>,
+    window_x: i32,
+    before: &[u8],
+    now: &[u8],
+) -> bool {
+    let x = window_x + ITEM_FIRST_ROW.0;
+    (0..ITEM_ROWS).zip(before.iter().zip(now)).any(|(row, (before, now))| {
+        let at = (x, ITEM_FIRST_ROW.1 + ITEM_ROW_PITCH * row);
+        let (Some(before), Some(now)) = (overlay.spelling.get(before), overlay.spelling.get(now))
+        else {
+            return false;
+        };
+        row_spells(letters, at, before) && !row_spells(letters, at, now)
+    })
+}
+
+/// The character the screen's `cells` (spelled by `character`) show at each place.
+fn letters_at(
+    cells: &[TextCell],
+    character: &dyn Fn(u8) -> Option<char>,
+) -> FxHashMap<(i32, i32), char> {
+    cells.iter().filter_map(|cell| Some(((cell.x, cell.y), character(cell.glyph)?))).collect()
+}
+
+/// Adds to `placed` the name of each entry of a shop's page that a spelling objects share is (by the place of its
+/// row's first letter), when the screen (`cells`, spelled by `character`) shows that page: the page's places `places`
+/// (from its first place's) show the entries `ids` in turn. One place only, the first place's, is where every place
+/// with an entry spells it and every place past the list is blank ([`shows`]). A place spelling its entry without
+/// the first letter, that letter's cell blank, is its entry too: the row just sold (`▶ couter`), whose part starts a
+/// cell right. `None` (nothing added) when an entry has no spelling to check.
+fn place_on_page<'a>(
+    overlay: &'a Overlay,
+    cells: &[TextCell],
+    character: &dyn Fn(u8) -> Option<char>,
+    places: &[(i32, i32)],
+    ids: &[u8],
+    placed: &mut FxHashMap<(i32, i32), &'a str>,
+) -> Option<()> {
+    // (each place's entry and its spelling; `None` past the list)
+    let mut entries: Vec<Option<(u8, &str)>> = Vec::with_capacity(places.len());
+    for n in 0..places.len() {
+        entries.push(match ids.get(n) {
+            Some(&id) => Some((id, overlay.spelling.get(&id)?.as_str())),
+            None => None,
+        });
+    }
+    if !entries.iter().flatten().any(|(id, _)| overlay.objects.by_id.contains_key(id)) {
+        return None;
+    }
+    let (_, first) = (*entries.first()?)?;
+    let letters: FxHashMap<(i32, i32), char> =
+        cells.iter().filter_map(|cell| Some(((cell.x, cell.y), character(cell.glyph)?))).collect();
+    // (the first place is where the first entry's first letter is, or a cell left of its second letter)
+    let mut spelling = first.chars();
+    let (lead, second) = (spelling.next()?, spelling.next()?);
+    let mut starts: Vec<(i32, i32)> = letters
+        .iter()
+        .flat_map(|(&(x, y), &ch)| {
+            [(ch == lead).then_some((x, y)), (ch == second).then_some((x - 8, y))]
+        })
+        .flatten()
+        .collect();
+    starts.sort_unstable();
+    starts.dedup();
+    let mut fits = starts.into_iter().filter_map(|(x, y)| {
+        places
+            .iter()
+            .zip(&entries)
+            .map(|(&(dx, dy), entry)| shows(&letters, (x + dx, y + dy), entry.map(|(_, e)| e)))
+            .collect::<Option<Vec<i32>>>()
+            .map(|lefts| (y, lefts))
+    });
+    let (Some((y, lefts)), None) = (fits.next(), fits.next()) else { return None };
+    for ((&(_, dy), entry), left) in places.iter().zip(&entries).zip(lefts) {
+        if let Some((id, _)) = entry
+            && let Some(name) = overlay.objects.by_id.get(id)
+        {
+            placed.insert((left, y + dy), name.as_str());
+        }
+    }
+    Some(())
+}
+
+/// Where the first letter of the name at the place `at` of a list's page is, when the screen's `letters` show
+/// `spelling` there: the spelling from `at`, or without its first letter from a cell right of it (its first
+/// letter's cell blank), with no letter after it; with no spelling (a place past the list), none of the place's
+/// cells holds a letter. `None` when they do not.
+fn shows(
+    letters: &FxHashMap<(i32, i32), char>,
+    (x, y): (i32, i32),
+    spelling: Option<&str>,
+) -> Option<i32> {
+    let Some(spelling) = spelling else {
+        return (0..PLACE_ROOM).all(|cell| !lettered(letters, (x + 8 * cell, y))).then_some(x);
+    };
+    if spelled_from(letters, (x, y), spelling, 0) {
+        Some(x)
+    } else if !lettered(letters, (x, y)) && spelled_from(letters, (x + 8, y), spelling, 1) {
+        Some(x + 8)
+    } else {
+        None
+    }
+}
+
+/// The cells a row of the Item screen's list has for a name: the list writes no more of a name than fits them.
+const ITEM_NAME_ROOM: usize = 10;
+
+/// Whether the screen's `letters` spell `spelling` from `at` as a row of the Item screen's list writes it: the whole
+/// of it with no letter after it ([`spelled_from`]), or, of a spelling longer than the row has room for, as much as
+/// fits ([`ITEM_NAME_ROOM`] cells).
+fn row_spells(letters: &FxHashMap<(i32, i32), char>, at: (i32, i32), spelling: &str) -> bool {
+    if spelling.chars().count() <= ITEM_NAME_ROOM {
+        return spelled_from(letters, at, spelling, 0);
+    }
+    (0..).zip(spelling.chars().take(ITEM_NAME_ROOM)).all(|(cell, ch): (i32, char)| {
+        let shown = letters.get(&(at.0 + 8 * cell, at.1)).copied();
+        if ch == ' ' { shown.is_none_or(|shown| shown == ' ') } else { shown == Some(ch) }
+    })
+}
+
+/// Whether the screen's `letters` hold a letter or a digit at `at`.
+fn lettered(letters: &FxHashMap<(i32, i32), char>, at: (i32, i32)) -> bool {
+    letters.get(&at).is_some_and(|ch| ch.is_alphanumeric())
+}
+
+/// Whether the screen's `letters` spell `spelling` without its first `skip` characters from `left` on row `y`, a
+/// cell a character (a space of the spelling is a blank cell or a space), with no letter after it.
+fn spelled_from(
+    letters: &FxHashMap<(i32, i32), char>,
+    (left, y): (i32, i32),
+    spelling: &str,
+    skip: usize,
+) -> bool {
+    let mut at = left;
+    for ch in spelling.chars().skip(skip) {
+        let shown = letters.get(&(at, y)).copied();
+        let fits =
+            if ch == ' ' { shown.is_none_or(|shown| shown == ' ') } else { shown == Some(ch) };
+        if !fits {
+            return false;
+        }
+        at += 8;
+    }
+    !lettered(letters, (at, y))
+}
+
+/// Adds to `placed`, for each part of `parts` not named yet that spells a name objects share and the overlay
+/// translates apart, by the place of its first letter: the end the objects' names share ([`Overlay::alike`]: both
+/// Scouters a `探測器`), else, when `by_bag` and the bag has [`settled`](ObjectLists::settled) (the screen shows a
+/// change to it some frames late), the name of the one of them the bag (`lists.items`) holds, when the screen has no
+/// more rows spelling it than the bag has entries of that object (a card just dropped from the bag still shows, a row
+/// of the other card's beside it, for some frames). A spelling whose objects the bag holds both or neither of is not
+/// named.
+fn place_alike<'a>(
+    overlay: &'a Overlay,
+    parts: &[(String, Vec<&TextCell>)],
+    lists: &ObjectLists,
+    by_bag: bool,
+    placed: &mut FxHashMap<(i32, i32), &'a str>,
+) {
+    let objects = &overlay.objects;
+    let by_bag = by_bag && lists.settled();
+    for (english, part) in parts {
+        let english = english.trim_end();
+        let (Some(ids), Some(first)) = (objects.spelled.get(english), part.first()) else {
+            continue;
+        };
+        if !ids.iter().any(|id| objects.by_id.contains_key(id))
+            || placed.contains_key(&(first.x, first.y))
+        {
+            continue;
+        }
+        let name = overlay.alike.get(english).map(String::as_str).or_else(|| {
+            if !by_bag {
+                return None;
+            }
+            let mut held = ids.iter().filter(|id| lists.items.contains(id));
+            let (Some(id), None) = (held.next(), held.next()) else { return None };
+            let most = lists.items.iter().fold(0, |n, entry| n + usize::from(entry == id));
+            let rows = parts.iter().filter(|(other, _)| other.trim_end() == english).count();
+            (rows <= most).then(|| objects.by_id.get(id).map(String::as_str)).flatten()
+        });
+        if let Some(name) = name {
+            placed.insert((first.x, first.y), name);
+        }
+    }
 }
 
 /// Hides the letters of the words a window over a list cuts at their end (the Item screen's `INT` / `EXT` / `AID`
@@ -2281,7 +2697,9 @@ type CutRow<'a> = (&'a [&'a TextCell], &'a str, bool);
 /// ([`hide_cut_words`]).
 ///
 /// A list whose cursor is written over the first letter of a row is another thing: see `listed` below, whose rows
-/// show their names.
+/// show their names. A part `placed` names (by the place of its first cell: a row of a list of objects whose first
+/// letter the cursor cuts, [`place_objects`]) is such a row, with that name.
+#[allow(clippy::too_many_arguments)]
 fn draw_covered_column(
     overlay: &Overlay,
     target: &mut Target<'_>,
@@ -2290,6 +2708,7 @@ fn draw_covered_column(
     frame_width: usize,
     character: &dyn Fn(u8) -> Option<char>,
     unnamed: &[(String, Vec<&TextCell>)],
+    placed: &FxHashMap<(i32, i32), &str>,
 ) {
     let tiled: FxHashMap<(i32, i32), &TextCell> =
         cells.iter().map(|cell| ((cell.x, cell.y), cell)).collect();
@@ -2347,11 +2766,12 @@ fn draw_covered_column(
         if part.is_empty() || english.trim().is_empty() {
             continue;
         }
-        let listed = listed(part);
+        let by_id = placed.get(&(part[0].x, part[0].y)).copied();
+        let listed = by_id.is_some() || listed(part);
         let Some(from) = (if listed { Some(0) } else { cut(part) }) else { continue };
         let letters = &part[from..];
         let spelled: String = letters.iter().filter_map(|cell| character(cell.glyph)).collect();
-        if let Some(name) = name(spelled.trim()) {
+        if let Some(name) = by_id.or_else(|| name(spelled.trim())) {
             columns.entry(letters[0].x).or_default().push((letters, name, listed));
         }
     }
@@ -3567,6 +3987,7 @@ fn paint_continue_mark(target: &mut Target<'_>, mark: &[u8], (x, y): (i32, i32))
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ssd_catalogue::engine::{ITEM_SCREEN_SETTLE, ShownPage};
 
     fn lines(wrapped: &[Vec<char>]) -> Vec<String> {
         wrapped.iter().map(|line| line.iter().collect()).collect()
@@ -7550,6 +7971,724 @@ mod tests {
         };
         let before = [vec![cell(72, 8, ' ')], word(88, 8, "ulma"), word(0, 8, "Radar")].concat();
         assert!(!shown_at(&before, 88), "a name left of it on its row is no column after it");
+    }
+
+    /// The letters of the tests of the objects named by id, each the glyph of its place.
+    const ABC: &str = " ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+    fn object_letter(glyph: u8) -> Option<char> {
+        ABC.chars().nth(usize::from(glyph))
+    }
+
+    /// An overlay with the names `names` by spelling (the screen's other names: the shared spellings are none of
+    /// them, see `screen_names`) and the objects `spelled` (spelling, ids) of which `by_id` (id, name) are named by id.
+    fn object_overlay(
+        names: &[(&str, &str)],
+        spelled: &[(&str, &[u8])],
+        by_id: &[(u8, &str)],
+    ) -> Overlay {
+        let names = names.iter().map(|&(english, name)| (english.to_owned(), name.to_owned()));
+        let objects = ObjectNames {
+            spelled: spelled
+                .iter()
+                .map(|&(english, ids)| (english.to_owned(), ids.to_vec()))
+                .collect(),
+            by_id: by_id.iter().map(|&(id, name)| (id, name.to_owned())).collect(),
+        };
+        overlay().with_names(names.collect()).with_objects(objects)
+    }
+
+    /// The names `place_objects` gives the rows of `cells` from the lists `lists`.
+    fn placed(
+        overlay: &Overlay,
+        cells: &[TextCell],
+        lists: &ObjectLists,
+    ) -> Vec<((i32, i32), String)> {
+        placed_at(overlay, cells, lists, 0)
+    }
+
+    /// The names `place_objects` gives the rows of `cells` from the lists `lists`, the original's window at
+    /// `window_x`.
+    fn placed_at(
+        overlay: &Overlay,
+        cells: &[TextCell],
+        lists: &ObjectLists,
+        window_x: i32,
+    ) -> Vec<((i32, i32), String)> {
+        let parts = name_parts(cells, &object_letter);
+        let mut placed: Vec<((i32, i32), String)> =
+            place_objects(overlay, &parts, cells, &object_letter, lists, window_x)
+                .into_iter()
+                .map(|(at, name)| (at, name.to_owned()))
+                .collect();
+        placed.sort();
+        placed
+    }
+
+    fn at(places: &[((i32, i32), &str)]) -> Vec<((i32, i32), String)> {
+        places.iter().map(|&(at, name)| (at, name.to_owned())).collect()
+    }
+
+    /// `cells` drawn at scale 2 over a grey picture by [`draw_names_listed`] with the lists `lists`.
+    fn listed_drawn(overlay: &Overlay, cells: &[TextCell], lists: &ObjectLists) -> Vec<u8> {
+        let mut rgba = [7_u8, 7, 7, 255].repeat(512 * 448);
+        let mut target = Target { rgba: &mut rgba, width: 512, scale: 2 };
+        draw_names_listed(overlay, &mut target, cells, &[], 0, &object_letter, lists, 0);
+        rgba
+    }
+
+    /// `cells` drawn at scale 2 over a grey picture by [`draw_names`].
+    fn names_drawn(overlay: &Overlay, cells: &[TextCell]) -> Vec<u8> {
+        let mut rgba = [7_u8, 7, 7, 255].repeat(512 * 448);
+        let mut target = Target { rgba: &mut rgba, width: 512, scale: 2 };
+        draw_names(overlay, &mut target, cells, &[], 0, &object_letter);
+        rgba
+    }
+
+    /// The 2x pixels of the 16 rows of the cells of 1x row `y`.
+    fn band(rgba: &[u8], y: usize) -> &[u8] {
+        &rgba[2 * y * 512 * 4..(2 * y + 16) * 512 * 4]
+    }
+
+    /// The lists of a frame whose screen shows page `first` of the shop's list `stock` (steady or not).
+    fn shop_page(stock: &[u8], first: usize, steady: bool) -> ObjectLists {
+        let ids = stock.to_vec();
+        ObjectLists {
+            items: Vec::new(),
+            stock: Some(ids.clone()),
+            shown: Some(ShownPage { first, ids }),
+            steady,
+            ..ObjectLists::default()
+        }
+    }
+
+    /// The lists of a frame with no list of objects up, the bag `items` (held long enough), steady or not.
+    fn no_page(items: &[u8], steady: bool) -> ObjectLists {
+        ObjectLists {
+            items: items.to_vec(),
+            stock: None,
+            shown: None,
+            steady,
+            held: ITEM_SCREEN_SETTLE,
+            ..ObjectLists::default()
+        }
+    }
+
+    /// The lists of a frame with the Item screen up on page `page` of the bag `items`, its state held `held` frames.
+    fn item_screen(items: &[u8], page: u8, held: u32) -> ObjectLists {
+        ObjectLists {
+            items: items.to_vec(),
+            steady: true,
+            screen: Some(2),
+            page: Some(page),
+            held,
+            ..ObjectLists::default()
+        }
+    }
+
+    /// The lists of a frame `held` frames after the Item screen's state changed once: it had settled on page
+    /// `before.1` of the bag `before.0`, and tells page `now.1` of the bag `now.0` now.
+    fn item_screen_changed(before: (&[u8], u8), now: (&[u8], u8), held: u32) -> ObjectLists {
+        ObjectLists {
+            shown_screen: Some(2),
+            shown_page: Some(before.1),
+            shown_items: before.0.to_vec(),
+            changes: 1,
+            ..item_screen(now.0, now.1, held)
+        }
+    }
+
+    /// The overlay of the Item screen tests: a few objects of one spelling each, the two Scouters (16, 17) and the two
+    /// Turtles (24, 25) with their names.
+    fn item_overlay() -> Overlay {
+        object_overlay(
+            &[("Bulma", "QQ")],
+            &[
+                ("Kami", &[0]),
+                ("Roshi", &[1]),
+                ("Bulma", &[2]),
+                ("Grandpa", &[7]),
+                ("Lunch", &[9]),
+                ("Fly", &[22]),
+                ("Scouter", &[16, 17]),
+                ("Turtle", &[24, 25]),
+            ],
+            &[(16, "紅探測器"), (17, "綠探測器"), (24, "青蛙"), (25, "海龜")],
+        )
+    }
+
+    /// The Item screen's rows spelling `names`, one a row, where the list has them with the original's window at x 0:
+    /// from x 32, y 31, 16 apart. An empty name is a row with nothing on it.
+    fn item_rows(names: &[&str]) -> Vec<TextCell> {
+        item_rows_at(names, 32, 31)
+    }
+
+    /// Rows spelling `names`, one a row 16 apart, the first at (`x`, `y`).
+    fn item_rows_at(names: &[&str], x: i32, y: i32) -> Vec<TextCell> {
+        (0..)
+            .zip(names)
+            .flat_map(|(row, name): (i32, &&str)| spelled(ABC, x, y + 16 * row, name))
+            .collect()
+    }
+
+    /// The overlay of the shop tests: a few objects of one spelling each, the two Scouters (16 `AA`, 17 `BB`) and the
+    /// two Turtles (24 `CC`, 25 `DD`).
+    fn shop_overlay() -> Overlay {
+        object_overlay(
+            &[("Bulma", "QQ")],
+            &[
+                ("Kami", &[0]),
+                ("Roshi", &[1]),
+                ("Bulma", &[2]),
+                ("Grandpa", &[7]),
+                ("Lunch", &[9]),
+                ("Fly", &[22]),
+                ("Scouter", &[16, 17]),
+                ("Turtle", &[24, 25]),
+            ],
+            &[(16, "AA"), (17, "BB"), (24, "CC"), (25, "DD")],
+        )
+    }
+
+    /// The second page of a shop selling `[0, 1, 2, 7, 1, 0, 7, 22, a, b, 9]` as the screen shows it: along the
+    /// rows first, the left column's names from x 64, the right's from x 136, rows 16 apart from y 32, the sixth
+    /// place past the list and blank.
+    fn second_page() -> Vec<TextCell> {
+        [
+            spelled(ABC, 64, 32, "Grandpa"),
+            spelled(ABC, 136, 32, "Fly"),
+            spelled(ABC, 64, 48, "Scouter"),
+            spelled(ABC, 136, 48, "Scouter"),
+            spelled(ABC, 64, 64, "Lunch"),
+        ]
+        .concat()
+    }
+
+    const SELLING_BOTH: [u8; 11] = [0, 1, 2, 7, 1, 0, 7, 22, 16, 17, 9];
+
+    /// The 2x pixels of the cells of 1x row `y` from 1x x `from` to before `to`, row by row.
+    fn patch(rgba: &[u8], from: usize, to: usize, y: usize) -> Vec<u8> {
+        (2 * y..2 * y + 16)
+            .flat_map(|row| rgba[(row * 512 + 2 * from) * 4..(row * 512 + 2 * to) * 4].to_vec())
+            .collect()
+    }
+
+    #[test]
+    fn a_shop_page_names_each_shared_row_by_its_entry_along_the_rows() {
+        // Entries 6 to 10 on the page: 7, 22 / 16, 17 / 9: both Scouters on the second row, 16 left, 17 right
+        let named = shop_overlay();
+        let cells = second_page();
+        assert_eq!(
+            placed(&named, &cells, &shop_page(&SELLING_BOTH, 6, true)),
+            at(&[((64, 48), "AA"), ((136, 48), "BB")])
+        );
+        let mut swapped = SELLING_BOTH;
+        swapped.swap(8, 9);
+        assert_eq!(
+            placed(&named, &cells, &shop_page(&swapped, 6, true)),
+            at(&[((64, 48), "BB"), ((136, 48), "AA")]),
+            "17 first: the left one is 17's"
+        );
+        // Each is drawn as the page is with the spelling named so
+        let rgba = listed_drawn(&named, &cells, &shop_page(&SELLING_BOTH, 6, true));
+        let spelled_as = |name: &str| {
+            let overlay = overlay().with_names([("Scouter".to_owned(), name.to_owned())].into());
+            names_drawn(&overlay, &cells)
+        };
+        assert!(patch(&rgba, 64, 136, 48) == patch(&spelled_as("AA"), 64, 136, 48), "left AA");
+        assert!(patch(&rgba, 136, 256, 48) == patch(&spelled_as("BB"), 136, 256, 48), "right BB");
+        assert!(patch(&rgba, 64, 136, 48) != patch(&spelled_as("BB"), 64, 136, 48), "not BB");
+    }
+
+    #[test]
+    fn a_page_the_screen_does_not_spell_keeps_its_english() {
+        let overlay = shop_overlay();
+        let cells = second_page();
+        // The first page's entries are not what the screen shows
+        assert_eq!(placed(&overlay, &cells, &shop_page(&SELLING_BOTH, 0, true)), at(&[]), "page 1");
+        // A place past the list with letters on it
+        let longer = [second_page(), spelled(ABC, 136, 64, "Kami")].concat();
+        assert_eq!(
+            placed(&overlay, &longer, &shop_page(&SELLING_BOTH, 6, true)),
+            at(&[]),
+            "a sixth row"
+        );
+        // A place whose entry is spelled otherwise on the screen
+        let mut other = SELLING_BOTH;
+        other[10] = 2;
+        assert_eq!(
+            placed(&overlay, &cells, &shop_page(&other, 6, true)),
+            at(&[]),
+            "Bulma, not Lunch"
+        );
+        // An entry past its place's room: a name of eight letters where seven show
+        let longer_name = [second_page(), spelled(ABC, 120, 48, "s")].concat();
+        assert_eq!(
+            placed(&overlay, &longer_name, &shop_page(&SELLING_BOTH, 6, true)),
+            at(&[]),
+            "Scouters"
+        );
+        // Nothing drawn over the rows
+        let rgba = listed_drawn(&overlay, &cells, &shop_page(&SELLING_BOTH, 0, true));
+        assert!(band(&rgba, 48).chunks(4).all(|px| px == [7, 7, 7, 255]), "the row is left alone");
+    }
+
+    #[test]
+    fn a_page_that_has_not_held_two_frames_keeps_its_english() {
+        // Selling from a bag of Scouters 16 and 17 in turn: a page whose entries moved by one spells the same, so only
+        // the page having held since the frame before tells the screen has it
+        let overlay = shop_overlay();
+        let cells = [
+            spelled(ABC, 64, 32, "Scouter"),
+            spelled(ABC, 136, 32, "Scouter"),
+            spelled(ABC, 64, 48, "Scouter"),
+            spelled(ABC, 136, 48, "Scouter"),
+        ]
+        .concat();
+        let bag = [16, 17, 16, 17];
+        assert_eq!(placed(&overlay, &cells, &shop_page(&bag, 0, false)), at(&[]), "not steady");
+        let rgba = listed_drawn(&overlay, &cells, &shop_page(&bag, 0, false));
+        assert!(band(&rgba, 32).chunks(4).all(|px| px == [7, 7, 7, 255]), "the row is left alone");
+        assert_eq!(
+            placed(&overlay, &cells, &shop_page(&bag, 0, true)),
+            at(&[((64, 32), "AA"), ((64, 48), "AA"), ((136, 32), "BB"), ((136, 48), "BB")]),
+            "steady"
+        );
+    }
+
+    #[test]
+    fn a_sold_row_without_its_first_letter_is_its_entry() {
+        // Right after a sale the sold row's first letter is blanked (`▶ couter`) for some 84 frames: the page still
+        // is its entries, the sold row drawn with its object's name
+        let overlay = shop_overlay();
+        let cells = [
+            spelled(ABC, 64, 32, " couter"),
+            spelled(ABC, 136, 32, "Scouter"),
+            spelled(ABC, 64, 48, "Kami"),
+        ]
+        .concat();
+        let bag = [16, 17, 0];
+        assert_eq!(
+            placed(&overlay, &cells, &shop_page(&bag, 0, true)),
+            at(&[((72, 32), "AA"), ((136, 32), "BB")])
+        );
+        let rgba = listed_drawn(&overlay, &cells, &shop_page(&bag, 0, true));
+        assert_ne!(pixel(&rgba, 2 * 72 + 1, 2 * 32 + 3), [7, 7, 7], "the sold row is drawn");
+        // Another letter missing is no sold row
+        let cut = [
+            spelled(ABC, 64, 32, "Scoute "),
+            spelled(ABC, 136, 32, "Scouter"),
+            spelled(ABC, 64, 48, "Kami"),
+        ]
+        .concat();
+        assert_eq!(placed(&overlay, &cut, &shop_page(&bag, 0, true)), at(&[]));
+    }
+
+    #[test]
+    fn a_page_the_screen_spells_in_two_places_keeps_its_english() {
+        // One entry, and two places it could be with nothing where the rest of a page would be
+        let overlay = shop_overlay();
+        let cells = [spelled(ABC, 64, 32, "Scouter"), spelled(ABC, 64, 120, "Scouter")].concat();
+        assert_eq!(placed(&overlay, &cells, &shop_page(&[16], 0, true)), at(&[]));
+        let one = spelled(ABC, 64, 32, "Scouter");
+        assert_eq!(placed(&overlay, &one, &shop_page(&[16], 0, true)), at(&[((64, 32), "AA")]));
+    }
+
+    #[test]
+    fn off_a_page_a_shared_spelling_is_named_by_what_its_objects_share() {
+        // With no page to name rows by, a row takes the name the objects share, or the one the bag holds: the rows of
+        // the bag's second page
+        let overlay = object_overlay(
+            &[("Bulma", "QQ")],
+            &[("Kami", &[0]), ("Scouter", &[16, 17]), ("Turtle", &[24, 25])],
+            &[(16, "紅探測器"), (17, "綠探測器"), (24, "青蛙"), (25, "海龜")],
+        );
+        let cells = [
+            spelled(ABC, 32, 30, "Scouter"),
+            spelled(ABC, 32, 46, "Scouter"),
+            spelled(ABC, 32, 62, "Turtle"),
+            spelled(ABC, 32, 78, "Turtle"),
+        ]
+        .concat();
+        let scouters = [((32, 30), "探測器"), ((32, 46), "探測器")];
+        let bag = [0, 0, 0, 0, 0, 0, 0, 0, 16, 17, 24, 25];
+        assert_eq!(placed(&overlay, &cells, &no_page(&bag, true)), at(&scouters));
+        // A card dropped: the bag holds one 24 while the screen still shows both rows, so neither is 24's
+        let dropped = [0, 0, 0, 0, 0, 0, 0, 0, 16, 17, 24];
+        assert_eq!(placed(&overlay, &cells, &no_page(&dropped, true)), at(&scouters), "two rows");
+        // One row, one card
+        let one = [spelled(ABC, 32, 30, "Scouter"), spelled(ABC, 32, 46, "Turtle")].concat();
+        assert_eq!(
+            placed(&overlay, &one, &no_page(&[16, 24], true)),
+            at(&[((32, 30), "探測器"), ((32, 46), "青蛙")])
+        );
+    }
+
+    #[test]
+    fn with_no_list_up_a_shared_spelling_takes_the_name_its_objects_share() {
+        // No page of a list on the screen: the two Scouters' names end alike (the name they share), the two Turtles'
+        // do not, and a Turtle is named only when the lists hold one of the two
+        let overlay = object_overlay(
+            &[("Bulma", "QQ")],
+            &[("Scouter", &[16, 17]), ("Turtle", &[24, 25])],
+            &[(16, "紅探測器"), (17, "綠探測器"), (24, "青蛙"), (25, "海龜")],
+        );
+        let cells = [spelled(ABC, 32, 8, "Scouter"), spelled(ABC, 32, 24, "Turtle")].concat();
+        assert_eq!(
+            placed(&overlay, &cells, &no_page(&[16, 17, 24, 25], true)),
+            at(&[((32, 8), "探測器")])
+        );
+        assert_eq!(
+            placed(&overlay, &cells, &no_page(&[16, 25], true)),
+            at(&[((32, 8), "探測器"), ((32, 24), "海龜")])
+        );
+        assert_eq!(placed(&overlay, &cells, &no_page(&[], true)), at(&[((32, 8), "探測器")]));
+        assert_eq!(placed(&overlay, &cells, &no_page(&[25], false)), at(&[]), "a list just closed");
+        let moving = ObjectLists { held: ITEM_SCREEN_SETTLE - 1, ..no_page(&[16, 25], true) };
+        assert_eq!(
+            placed(&overlay, &cells, &moving),
+            at(&[((32, 8), "探測器")]),
+            "the bag just changed"
+        );
+        // Names sharing one character only are not a name
+        let apart = object_overlay(
+            &[("Bulma", "QQ")],
+            &[("Scouter", &[16, 17])],
+            &[(16, "紅器"), (17, "綠器")],
+        );
+        assert_eq!(placed(&apart, &cells, &no_page(&[], true)), at(&[]));
+    }
+
+    #[test]
+    fn the_item_screen_names_each_row_by_its_entry_once_settled() {
+        // Page 1 of a bag of twelve: entries 8 to 11 on rows 0 to 3
+        let overlay = item_overlay();
+        let bag = [0, 1, 2, 7, 9, 22, 0, 1, 16, 17, 24, 25];
+        let cells = item_rows(&["Scouter", "Scouter", "Turtle", "Turtle"]);
+        assert_eq!(
+            placed(&overlay, &cells, &item_screen(&bag, 1, ITEM_SCREEN_SETTLE)),
+            at(&[
+                ((32, 31), "紅探測器"),
+                ((32, 47), "綠探測器"),
+                ((32, 63), "青蛙"),
+                ((32, 79), "海龜")
+            ])
+        );
+        let mut swapped = bag;
+        swapped.swap(8, 9);
+        swapped.swap(10, 11);
+        assert_eq!(
+            placed(&overlay, &cells, &item_screen(&swapped, 1, ITEM_SCREEN_SETTLE)),
+            at(&[
+                ((32, 31), "綠探測器"),
+                ((32, 47), "紅探測器"),
+                ((32, 63), "海龜"),
+                ((32, 79), "青蛙")
+            ]),
+            "the other order"
+        );
+        // Not the page the screen shows, or not settled: the name the Scouters share
+        let shared = at(&[((32, 31), "探測器"), ((32, 47), "探測器")]);
+        assert_eq!(
+            placed(&overlay, &cells, &item_screen(&bag, 0, ITEM_SCREEN_SETTLE)),
+            shared,
+            "page 0"
+        );
+        assert_eq!(
+            placed(&overlay, &cells, &item_screen(&bag, 1, ITEM_SCREEN_SETTLE - 1)),
+            shared,
+            "not settled"
+        );
+    }
+
+    #[test]
+    fn a_card_dropped_keeps_its_row_english_until_the_item_screen_settles() {
+        // A bag of nine, 24 first on page 0 and 25 alone on page 1, the screen on page 1. 25 dropped: the bag is eight
+        // with 24 only and back on page 0, while for some frames the screen still shows page 1, 25's row with page 0's
+        // rows left below it, spelled just as page 0 is
+        let overlay = item_overlay();
+        let cells =
+            item_rows(&["Turtle", "Roshi", "Bulma", "Grandpa", "Lunch", "Fly", "Kami", "Roshi"]);
+        let bag = [24, 1, 2, 7, 9, 22, 0, 1];
+        for held in [0, 12, ITEM_SCREEN_SETTLE - 1] {
+            assert_eq!(
+                placed(&overlay, &cells, &item_screen(&bag, 0, held)),
+                at(&[]),
+                "held {held}"
+            );
+        }
+        let rgba = listed_drawn(&overlay, &cells, &item_screen(&bag, 0, 12));
+        assert!(band(&rgba, 31).chunks(4).all(|px| px == [7, 7, 7, 255]), "the row is left alone");
+        // Settled, the screen shows page 0: 24's row
+        assert_eq!(
+            placed(&overlay, &cells, &item_screen(&bag, 0, ITEM_SCREEN_SETTLE)),
+            at(&[((32, 31), "青蛙")])
+        );
+    }
+
+    #[test]
+    fn a_short_page_names_only_the_rows_of_its_entries() {
+        // Page 1 of a bag of twelve: its four entries on rows 0 to 3, and rows 4 to 7 still page 0's rows 4 to 7 (the
+        // screen redraws only the rows of a short page). Those rows are none of the page's: the Scouters' row takes the
+        // name they share, the Turtle's keeps its English though the bag's entry 5 is that Turtle, its only one
+        let overlay = item_overlay();
+        let bag = [0, 1, 2, 7, 17, 24, 9, 22, 16, 17, 0, 1];
+        let cells = item_rows(&[
+            "Scouter", "Scouter", "Kami", "Roshi", "Scouter", "Turtle", "Lunch", "Fly",
+        ]);
+        assert_eq!(
+            placed(&overlay, &cells, &item_screen(&bag, 1, ITEM_SCREEN_SETTLE)),
+            at(&[((32, 31), "紅探測器"), ((32, 47), "綠探測器"), ((32, 95), "探測器")])
+        );
+    }
+
+    #[test]
+    fn an_item_page_with_a_row_spelled_otherwise_is_not_named_by_its_entries() {
+        // Page 0 of a bag of four, its third row not its entry's spelling: no row is named by its entry
+        let overlay = item_overlay();
+        let bag = [16, 17, 24, 25];
+        let cells = item_rows(&["Scouter", "Scouter", "Kami", "Turtle"]);
+        assert_eq!(
+            placed(&overlay, &cells, &item_screen(&bag, 0, ITEM_SCREEN_SETTLE)),
+            at(&[((32, 31), "探測器"), ((32, 47), "探測器")])
+        );
+        let right = item_rows(&["Scouter", "Scouter", "Turtle", "Turtle"]);
+        assert_eq!(
+            placed(&overlay, &right, &item_screen(&bag, 0, ITEM_SCREEN_SETTLE)),
+            at(&[
+                ((32, 31), "紅探測器"),
+                ((32, 47), "綠探測器"),
+                ((32, 63), "青蛙"),
+                ((32, 79), "海龜")
+            ]),
+            "spelled as its entries"
+        );
+    }
+
+    #[test]
+    fn a_row_left_below_a_short_page_is_not_named_by_what_the_bag_holds() {
+        // Page 1 of a bag of twelve, none of its four entries one of a shared spelling; row 5 still shows page 0's
+        // Turtle (25, dropped since: the bag's only Turtle now is 24, on page 0). Nothing tells whose row that is
+        let overlay = item_overlay();
+        let bag = [24, 1, 2, 7, 9, 22, 0, 1, 0, 1, 2, 7];
+        let cells =
+            item_rows(&["Kami", "Roshi", "Bulma", "Grandpa", "Lunch", "Turtle", "Kami", "Roshi"]);
+        assert_eq!(placed(&overlay, &cells, &item_screen(&bag, 1, ITEM_SCREEN_SETTLE)), at(&[]));
+        // The same with a row of the page not spelled as its entry (a window over it): still no name from the bag
+        let covered =
+            item_rows(&["", "Roshi", "Bulma", "Grandpa", "Lunch", "Turtle", "Kami", "Roshi"]);
+        assert_eq!(placed(&overlay, &covered, &item_screen(&bag, 1, ITEM_SCREEN_SETTLE)), at(&[]));
+    }
+
+    #[test]
+    fn rows_left_below_a_covered_short_page_are_not_taken_for_the_page() {
+        // A bag of ten: page 0 has 24 and Kami on rows 2 and 3, page 1 is 25 and Kami. On page 1 its two rows are
+        // covered (the window of a card being used) and rows 2 and 3 still show page 0's, spelled just as page 1's
+        // entries are: they are not page 1's rows
+        let overlay = item_overlay();
+        let bag = [1, 2, 24, 0, 7, 9, 22, 1, 25, 0];
+        let cells = item_rows(&["", "", "Turtle", "Kami", "Grandpa", "Lunch", "Fly", "Roshi"]);
+        assert_eq!(placed(&overlay, &cells, &item_screen(&bag, 1, ITEM_SCREEN_SETTLE)), at(&[]));
+        // Uncovered, page 1's own rows are named, the row left below is not
+        let shown =
+            item_rows(&["Turtle", "Kami", "Turtle", "Kami", "Grandpa", "Lunch", "Fly", "Roshi"]);
+        assert_eq!(
+            placed(&overlay, &shown, &item_screen(&bag, 1, ITEM_SCREEN_SETTLE)),
+            at(&[((32, 31), "海龜")])
+        );
+    }
+
+    #[test]
+    fn the_item_screens_rows_are_where_the_window_puts_them() {
+        // The list's first row is 32 right of the window's left and 31 down, wherever the window is; rows spelled as
+        // the page's entries anywhere else are not the list's
+        let overlay = item_overlay();
+        let bag = [16, 17, 24, 25];
+        let names = ["Scouter", "Scouter", "Turtle", "Turtle"];
+        let settled = item_screen(&bag, 0, ITEM_SCREEN_SETTLE);
+        let shared = |x: i32, y: i32| at(&[((x, y), "探測器"), ((x, y + 16), "探測器")]);
+        for window_x in [58, 100] {
+            assert_eq!(
+                placed_at(&overlay, &item_rows_at(&names, window_x + 32, 31), &settled, window_x),
+                at(&[
+                    ((window_x + 32, 31), "紅探測器"),
+                    ((window_x + 32, 47), "綠探測器"),
+                    ((window_x + 32, 63), "青蛙"),
+                    ((window_x + 32, 79), "海龜")
+                ]),
+                "window at {window_x}"
+            );
+        }
+        assert_eq!(
+            placed_at(&overlay, &item_rows_at(&names, 132, 31), &settled, 58),
+            shared(132, 31),
+            "the window elsewhere"
+        );
+        assert_eq!(
+            placed_at(&overlay, &item_rows_at(&names, 90, 47), &settled, 58),
+            shared(90, 47),
+            "a row lower"
+        );
+        assert_eq!(
+            placed_at(&overlay, &item_rows_at(&names, 90, 30), &settled, 58),
+            shared(90, 30),
+            "a pixel higher"
+        );
+    }
+
+    #[test]
+    fn a_row_whose_name_is_longer_than_the_list_has_room_for_is_its_entry_as_far_as_it_shows() {
+        // An object spelled with twelve characters: the list writes ten of them. The page is still the bag's, and its
+        // Turtles are named; a row not showing those ten is not that entry, and the page is not named
+        let overlay = object_overlay(
+            &[("Bulma", "QQ")],
+            &[("Kami", &[0]), ("rcule   RSai", &[27]), ("Turtle", &[24, 25])],
+            &[(24, "青蛙"), (25, "海龜")],
+        );
+        let bag = [24, 25, 0, 27];
+        let named = at(&[((32, 31), "青蛙"), ((32, 47), "海龜")]);
+        let cut = item_rows(&["Turtle", "Turtle", "Kami", "rcule   RS"]);
+        assert_eq!(placed(&overlay, &cut, &item_screen(&bag, 0, ITEM_SCREEN_SETTLE)), named);
+        let other = item_rows(&["Turtle", "Turtle", "Kami", "rcule   RK"]);
+        assert_eq!(placed(&overlay, &other, &item_screen(&bag, 0, ITEM_SCREEN_SETTLE)), at(&[]));
+        // A name that fits is still spelled whole, with no letter after it
+        let longer = item_rows(&["Turtle", "Turtle", "Kamis", "rcule   RS"]);
+        assert_eq!(placed(&overlay, &longer, &item_screen(&bag, 0, ITEM_SCREEN_SETTLE)), at(&[]));
+    }
+
+    #[test]
+    fn a_page_just_turned_keeps_the_names_of_the_page_still_on_the_screen() {
+        // A bag of twelve, the Item screen settled on page 0 and the page number just turned to 1: for some frames the
+        // screen still shows page 0, whose rows keep their names
+        let overlay = item_overlay();
+        let bag = [24, 25, 0, 1, 2, 7, 9, 22, 16, 17, 0, 1];
+        let page0 =
+            item_rows(&["Turtle", "Turtle", "Kami", "Roshi", "Bulma", "Grandpa", "Lunch", "Fly"]);
+        let turned = item_screen_changed((&bag, 0), (&bag, 1), 3);
+        let named = at(&[((32, 31), "青蛙"), ((32, 47), "海龜")]);
+        assert_eq!(placed(&overlay, &page0, &turned), named);
+        // The screen redrawn: page 1's four rows over page 0's. They are not page 0's, and page 1 has not settled
+        let page1 =
+            item_rows(&["Scouter", "Scouter", "Kami", "Roshi", "Bulma", "Grandpa", "Lunch", "Fly"]);
+        let shared = at(&[((32, 31), "探測器"), ((32, 47), "探測器")]);
+        assert_eq!(placed(&overlay, &page1, &turned), shared);
+        // After a second change, or with another screen up before, the page before is not told
+        let twice = ObjectLists { changes: 2, ..turned.clone() };
+        assert_eq!(placed(&overlay, &page0, &twice), at(&[]), "two changes");
+        let opened = ObjectLists { shown_screen: Some(0), ..turned.clone() };
+        assert_eq!(placed(&overlay, &page0, &opened), at(&[]), "the Item screen just opened");
+        // A card dropped: the bag before the drop names the rows still on the screen, the dropped card's too
+        let dropped = [24, 0, 1, 2, 7, 9, 22, 16, 17, 0, 1];
+        assert_eq!(
+            placed(&overlay, &page0, &item_screen_changed((&bag, 0), (&dropped, 0), 5)),
+            named
+        );
+    }
+
+    #[test]
+    fn rows_spelled_as_the_page_before_and_as_the_page_now_are_not_named_until_settled() {
+        // A bag of nine: 16 first on page 0, 17 alone on page 1. Turned to page 1, the screen shows `Scouter` on its
+        // first row over page 0's other rows whether it has redrawn or not: nothing tells which Scouter it is
+        let overlay = item_overlay();
+        let bag = [16, 1, 2, 7, 9, 22, 0, 1, 17];
+        let cells =
+            item_rows(&["Scouter", "Roshi", "Bulma", "Grandpa", "Lunch", "Fly", "Kami", "Roshi"]);
+        let shared = at(&[((32, 31), "探測器")]);
+        for held in [0, 9, ITEM_SCREEN_SETTLE - 1] {
+            let turned = item_screen_changed((&bag, 0), (&bag, 1), held);
+            assert_eq!(placed(&overlay, &cells, &turned), shared, "held {held}");
+        }
+        // Settled, the screen shows page 1
+        assert_eq!(
+            placed(&overlay, &cells, &item_screen(&bag, 1, ITEM_SCREEN_SETTLE)),
+            at(&[((32, 31), "綠探測器")])
+        );
+        // The other way, back to page 0 from page 1: the same rows, the same doubt
+        let back = item_screen_changed((&bag, 1), (&bag, 0), 4);
+        assert_eq!(placed(&overlay, &cells, &back), shared, "turned back");
+        // Nor when the page now cannot be checked (an entry with no spelling): that does not show the rows are not
+        // its rows. Back on page 0, whose last entry has no spelling, the screen redrawn
+        let unspelled = [16, 1, 2, 7, 9, 22, 0, 99, 17];
+        let redrawn =
+            item_rows(&["Scouter", "Roshi", "Bulma", "Grandpa", "Lunch", "Fly", "Kami", "Zzz"]);
+        let back = item_screen_changed((&unspelled, 1), (&unspelled, 0), 12);
+        assert_eq!(placed(&overlay, &redrawn, &back), shared, "a page that cannot be checked");
+        // Nor with no entry on the page now
+        let emptied = item_screen_changed((&bag, 1), (&bag[..8], 1), 3);
+        assert_eq!(placed(&overlay, &cells, &emptied), shared, "an empty page");
+    }
+
+    #[test]
+    fn off_a_shop_the_stock_left_does_not_count() {
+        // A shop's stock stays in the work RAM after the shop closes: with no shop's list up only the bag counts
+        let overlay = item_overlay();
+        let two = item_rows(&["Turtle", "Turtle"]);
+        let left = ObjectLists { stock: Some(vec![24, 24, 24]), ..no_page(&[24], true) };
+        assert_eq!(placed(&overlay, &two, &left), at(&[]), "two rows, one 24 in the bag");
+        let one = item_rows(&["Turtle"]);
+        let other = ObjectLists { stock: Some(vec![25]), ..no_page(&[24], true) };
+        assert_eq!(
+            placed(&overlay, &one, &other),
+            at(&[((32, 31), "青蛙")]),
+            "the bag's, not the stock's"
+        );
+    }
+
+    #[test]
+    fn the_exchanges_name_slot_is_object_24s_own_name() {
+        let table = Translation::parse(
+            "key\tzh\nstr3:0x03\t得到了援助卡牌\\n　　「{name:1}」！\nobject:24\t青蛙\nobject:25\t海龜\n",
+        )
+        .unwrap();
+        let face = ChineseFace::new(crate::font::SHARE_TECH_MONO.to_vec()).unwrap();
+        let overlay = Overlay::new(Arc::new(table), Arc::new(face));
+        let slot = |key: &str| OnScreen {
+            key: "str3:0x03".to_owned(),
+            names: [
+                Some(ssd_catalogue::engine::NameSlot {
+                    key: key.to_owned(),
+                    english: "Turtle".to_owned(),
+                }),
+                None,
+                None,
+            ],
+            ..screen(1.0)
+        };
+        assert_eq!(
+            overlay.text(&slot("object:24")).as_deref(),
+            Some("得到了援助卡牌\n　　「青蛙」！")
+        );
+        assert_eq!(
+            overlay.text(&slot("object:25")).as_deref(),
+            Some("得到了援助卡牌\n　　「海龜」！")
+        );
+    }
+
+    #[test]
+    fn the_shipped_tables_name_the_two_scouters_and_the_two_cards_apart() {
+        // Both packs, the same names: the Scouter of 10 points red, of 20 green; the cards a frog and a turtle
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../translations");
+        for code in ["zh-tw", "zh-hk"] {
+            let table = Translation::read(&root.join(code).join(format!("{code}.tsv"))).unwrap();
+            let names = [16, 17, 24, 25].map(|index| table.text(&format!("object:{index}")));
+            assert_eq!(
+                names,
+                [Some("紅探測器"), Some("綠探測器"), Some("青蛙"), Some("海龜")],
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn without_objects_named_by_id_the_names_are_drawn_as_before() {
+        let names = [("Scouter", "AA"), ("Bulma", "QQ")]
+            .map(|(english, name)| (english.to_owned(), name.to_owned()));
+        let overlay = overlay().with_names(names.into_iter().collect());
+        let cells = [spelled(ABC, 32, 8, "Scouter"), spelled(ABC, 32, 24, "Bulma")].concat();
+        let before = names_drawn(&overlay, &cells);
+        assert!(before != [7_u8, 7, 7, 255].repeat(512 * 448), "the names are drawn");
+        let lists = shop_page(&[16, 17], 0, true);
+        assert!(before == listed_drawn(&overlay, &cells, &lists), "the same pixels");
     }
 
     #[test]

@@ -39,7 +39,7 @@ use crate::pack::Pack;
 use crate::translate::{Beneath, Overlay, Target, Translator};
 use crate::{Binder, Frame, HdFrame, HdOptions, Memories, Pixel, Renderer, Unsupported, WIDTH};
 use rayon::prelude::*;
-use ssd_catalogue::engine::OnScreen;
+use ssd_catalogue::engine::{ObjectLists, OnScreen};
 use ssd_oracle::{CgramWrite, Color, FrameLog, LineEntry, LineRegs, OamWrite, VramWrite};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -429,6 +429,14 @@ impl WideRenderer {
     pub fn set_text_screen(&mut self, screen: Option<OnScreen>) {
         if let Some(translator) = self.translator.as_mut() {
             translator.screen = screen;
+        }
+    }
+
+    /// The lists of objects in the work RAM at the start of the next frame drawn ([`ssd_catalogue::engine`]), for
+    /// the translation's rows that spell a name objects share.
+    pub fn set_object_lists(&mut self, lists: ObjectLists) {
+        if let Some(translator) = self.translator.as_mut() {
+            translator.objects = lists;
         }
     }
 
@@ -1588,11 +1596,12 @@ pub struct WideRun {
 /// conditions.
 type Started = (u8, Option<FieldState>, Conditions);
 
-/// What a picture of [`WideRun::note_hd_shared`] was drawn from: the frame's start, the text page handed to the
-/// renderer, the HD options and the render log. Equal inputs draw the same picture.
+/// What a picture of [`WideRun::note_hd_shared`] was drawn from: the frame's start, the text page and the lists of
+/// objects handed to the renderer, the HD options and the render log. Equal inputs draw the same picture.
 struct Inputs {
     started: Started,
     text: Option<OnScreen>,
+    objects: ObjectLists,
     hd: HdOptions,
     log: FrameLog,
 }
@@ -1602,12 +1611,14 @@ impl Inputs {
         &self,
         started: &Started,
         text: Option<&OnScreen>,
+        objects: &ObjectLists,
         hd: HdOptions,
         log: &FrameLog,
     ) -> bool {
         self.hd == hd
             && self.started == *started
             && self.text.as_ref() == text
+            && self.objects == *objects
             && same_log(&self.log, log)
     }
 }
@@ -1666,11 +1677,14 @@ fn same_log(a: &FrameLog, b: &FrameLog) -> bool {
 
 /// The pages the message engine named, for the translation: at the end of the last frame noted, and at the start
 /// of the frame noted (or skipped) last; and the last page named at the end of a frame that was skipped, for the
-/// frame drawn next.
+/// frame drawn next. The lists of objects in the work RAM likewise, at the end of the last frame noted and at the
+/// start of the frame noted (or skipped) last.
 #[derive(Debug, Default)]
 struct TextRun {
     ended: Option<OnScreen>,
     started: Option<OnScreen>,
+    lists_ended: ObjectLists,
+    lists_started: ObjectLists,
     /// A page written at once (the Item help) is named for two frames only: when those frames run in a batch the
     /// window never draws (a fast-forward, or the frames the clock owes at speed 1), the frame drawn next starts
     /// from no page, and the overlay would keep the page before it (or none) over the new page's English.
@@ -1737,12 +1751,14 @@ impl WideRun {
         self.renderer().set_overlay(overlay);
     }
 
-    /// Tells the renderer the page the frame about to be drawn started from.
+    /// Tells the renderer the page and the lists of objects the frame about to be drawn started from.
     fn hand_text(&mut self) {
         // The page the frame started from, else the last page a skipped frame ended on (see [`TextRun::missed`])
         let started = self.text.as_mut().and_then(TextRun::hand);
-        if self.text.is_some() {
-            self.renderer().set_text_screen(started);
+        if let Some(lists) = self.text.as_ref().map(|text| text.lists_started.clone()) {
+            let renderer = self.renderer();
+            renderer.set_text_screen(started);
+            renderer.set_object_lists(lists);
         }
     }
 
@@ -1873,8 +1889,9 @@ impl WideRun {
         hd: HdOptions,
     ) -> Option<SharedHd> {
         let text = self.text.as_ref().and_then(|text| text.started.clone());
+        let objects = self.text.as_ref().map(|text| text.lists_started.clone()).unwrap_or_default();
         if let Some(drawn) = &self.shared
-            && drawn.inputs.is(&started, text.as_ref(), hd, log)
+            && drawn.inputs.is(&started, text.as_ref(), &objects, hd, log)
         {
             return Some(drawn.shared.clone());
         }
@@ -1890,7 +1907,7 @@ impl WideRun {
         let pending = renderer.art_pending();
         self.note_cost(false);
         let shared = SharedHd { serial: next_serial(), picture: Arc::new(picture) };
-        let inputs = Inputs { started, text, hd, log: log.clone() };
+        let inputs = Inputs { started, text, objects, hd, log: log.clone() };
         self.shared = (!pending).then(|| Drawn { inputs, shared: shared.clone() });
         Some(shared)
     }
@@ -2106,6 +2123,8 @@ impl WideRun {
             let hint = text.ended.as_ref().map(|screen| screen.page);
             let now = ssd_catalogue::engine::on_screen(&self.rom, wram, hint);
             text.started = std::mem::replace(&mut text.ended, now);
+            let lists = ssd_catalogue::engine::object_lists_after(wram, &text.lists_ended);
+            text.lists_started = std::mem::replace(&mut text.lists_ended, lists);
         }
         let rom = Rom(&self.rom);
         let current = (
@@ -4051,6 +4070,25 @@ mod tests {
 
     fn key(page: Option<OnScreen>) -> Option<String> {
         page.map(|page| page.key)
+    }
+
+    #[test]
+    fn a_shared_picture_is_drawn_again_when_only_the_object_lists_changed() {
+        // The two Scouters of the bag in one order, then the other: the rows spelling `Scouter` swap their names, so
+        // the picture is not the last one though the frame, its page and its log are the same
+        let started: Started = (0, None, Conditions::default());
+        let hd = HdOptions { scale: 2, look: crate::Look::Crisp };
+        let log = empty_log();
+        let lists = |items: Vec<u8>| ObjectLists { items, stock: None, ..ObjectLists::default() };
+        let inputs = Inputs {
+            started: started.clone(),
+            text: None,
+            objects: lists(vec![16, 17]),
+            hd,
+            log: log.clone(),
+        };
+        assert!(!inputs.is(&started, None, &lists(vec![17, 16]), hd, &log), "the order changed");
+        assert!(inputs.is(&started, None, &lists(vec![16, 17]), hd, &log), "the same lists");
     }
 
     #[test]

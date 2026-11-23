@@ -477,7 +477,10 @@ fn translation_overlay(
             .with_context(|| format!("{} is not a font", font.display()))?,
     );
     let names = ssd_catalogue::engine::screen_names(rom, &table);
-    Ok(Some(Arc::new(ssd_hd::translate::Overlay::new(table, face).with_names(names))))
+    let objects = ssd_catalogue::engine::object_names(rom, &table);
+    Ok(Some(Arc::new(
+        ssd_hd::translate::Overlay::new(table, face).with_names(names).with_objects(objects),
+    )))
 }
 
 fn pack_image(

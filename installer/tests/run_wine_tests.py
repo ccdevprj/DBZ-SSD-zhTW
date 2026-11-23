@@ -8,9 +8,9 @@ Defaults match the tools under ~/Tools (override with flags or env):
   --wine      ~/Tools/wine/11.0_1/wine/bin/wine          (env DBZ_WINE)
   --prefix    ~/Tools/wine/prefix-dbz-installer          (env DBZ_WINEPREFIX; a throwaway prefix, it gets reset)
   --makensis  ~/Tools/nsis/3.13/bin/makensis             (env DBZ_MAKENSIS; NSISDIR = <makensis>/../../share/nsis)
-  --old-setups ~/Tools/dbz-old-setups                    (env DBZ_OLD_SETUPS; the released RC1 / RC2 installers that the
+  --old-setups ~/Tools/dbz-old-setups                    (env DBZ_OLD_SETUPS; the released RC1, RC2, RC3 installers that the
                upgrade scenarios v01-v03 install first, SHA-256 checked; missing ones fail those scenarios, they are not skipped:
-               gh release download rc1 -R lming888/DBZ-SSD-zhTW -p '*setup.exe' -D <folder>, and rc2)
+               gh release download rc1 -R lming888/DBZ-SSD-zhTW -p '*setup.exe' -D <folder>, and rc2, rc3)
 
 --ref builds installer/ from another commit (git archive). A commit without /DELETEDATA support
 gets two edits so its "delete player data" section can run silently at all: the section is selected by default and the
@@ -58,13 +58,14 @@ OWN_KEY = "HKCU\\Software\\" + APP_ID
 PROGRAM_FILES = {EXE_NAME, UNINST, MARKER}
 # The upgrade scenarios (v01-v04): the installer under test is built a second time from a copy whose
 # launcher/RELEASE_NAME is NEXT_NAME and RELEASE is NEXT_RELEASE, so "the new version" is told apart from the old
-# installers, which are the released ones (RC1, RC2), checked against the SHA-256 of their Release's
+# installers, which are the released ones (RC1, RC2, RC3), checked against the SHA-256 of their Release's
 # SHA256SUMS_public.txt. They are not in the repo: --old-setups names the folder that holds them.
-NEXT_NAME = "RC3"
-NEXT_RELEASE = "47"
+NEXT_NAME = "v1.0"
+NEXT_RELEASE = "50"
 OLD_SETUPS = {
     "RC1": ("DBZ-SSD-zh-TW-RC1-setup.exe", "8b83a3d9c5181d911280f3c9a9c64d93d51e5deee9376c0fd52a3b31a9119bca", "45"),
     "RC2": ("DBZ-SSD-zh-TW-RC2-setup.exe", "7f05ad0ff00b528a137f45ed2401055e212860b8d8dc65f490e2f12a1d66a871", "46"),
+    "RC3": ("DBZ-SSD-zh-TW-RC3-setup.exe", "2037f62b49cf28c4b277526a1c785c146e17eb6cf84a0daf7478712290c29529", "47"),
 }
 
 HOME = Path.home()
@@ -284,7 +285,7 @@ class Build:
         self.work = work
         self.uncopies = 0  # uninstaller copies made so far (each run gets its own folder)
         self.drives = 0  # guidrive args files written so far
-        self.old_setups = None  # --old-setups: the folder of the released RC1 / RC2 installers (upgrade scenarios)
+        self.old_setups = None  # --old-setups: the folder of the released RC1, RC2, RC3 installers (upgrade scenarios)
 
     def compile(self, nsi: Path, defines: dict, strict=True) -> None:
         cmd = [str(self.makensis), "-V2"] + (["-WX"] if strict else [])
@@ -406,7 +407,7 @@ class Build:
         return out
 
     def old_setup(self, name: str) -> Path:
-        """The released installer `name` (RC1, RC2) from --old-setups, its SHA-256 checked against the Release's."""
+        """The released installer `name` (RC1, RC2, RC3) from --old-setups, its SHA-256 checked against the Release's."""
         file, sha, _ = OLD_SETUPS[name]
         where = self.old_setups / file if self.old_setups else None
         if where is None or not where.is_file():
@@ -1126,7 +1127,7 @@ def s25_marker_unreadable(c: Ctx):
 
 
 # ----------------------------------------------------------------------------------------------------------------------
-# Upgrade scenarios: a released RC1 / RC2 installer first, then the installer under test as the next release
+# Upgrade scenarios: a released RC1, RC2 or RC3 installer first, then the installer under test as the next release
 # (Build.next_setup). What they prove: the installer's own logic (where it installs, what it writes and leaves, the
 # registry, the shortcuts). What they do not: the real launcher of the next release (a stand-in is installed), what that
 # launcher does on its first run (the unpacked game of the old bundle in %LOCALAPPDATA%\dbz-ssd-zhtw\app is removed by
@@ -1228,6 +1229,11 @@ def v01_upgrade_rc1(c: Ctx):
 @scenario("已裝 RC2（真的 RC2 安裝程式、預設位置、玩過）→ 新版不帶 /D=：原地升級，一個項目、捷徑不重複、沒有多餘的檔、save\\ 與 hd-pack.zip 不變")
 def v02_upgrade_rc2(c: Ctx):
     upgrade_over(c, "RC2")
+
+
+@scenario("已裝 RC3（真的 RC3 安裝程式、預設位置、玩過）→ 新版不帶 /D=：原地升級，一個項目、捷徑不重複、沒有多餘的檔、save\\ 與 hd-pack.zip 不變")
+def upgrade_from_rc3(c: Ctx):
+    upgrade_over(c, "RC3")
 
 
 @scenario("RC1 裝在 A、RC2 裝在 B（各自玩過）→ 新版不帶 /D=：升級 B（登錄與記下的位置指的那份）；A 原封不動，RC2 時就已不在「新增或移除程式」裡")
@@ -2588,7 +2594,7 @@ def main(argv=None) -> int:
         "DBZ_MAKENSIS", HOME / "Tools/nsis/3.13/bin/makensis")))
     ap.add_argument("--old-setups", type=Path, default=Path(os.environ.get(
         "DBZ_OLD_SETUPS", HOME / "Tools/dbz-old-setups")),
-                    help="folder of the released DBZ-SSD-zh-TW-RC1-setup.exe and -RC2-setup.exe (upgrade scenarios v01-v03)")
+                    help="folder of the released DBZ-SSD-zh-TW-RC1-setup.exe, -RC2-setup.exe and -RC3-setup.exe (upgrade scenarios v01-v03 and upgrade_from_rc3)")
     ap.add_argument("--ref", help="build installer/ from this git commit instead of the working tree")
     ap.add_argument("--nsi", type=Path, help="build from this copy of dbz-zhtw.nsi (mutation checks)")
     ap.add_argument("--auto-update", action="store_true", help="compile with -DAUTO_UPDATE")

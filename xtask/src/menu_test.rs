@@ -140,18 +140,27 @@ pub(crate) struct Harness {
     tape: Option<Vec<Joypad>>,
     /// The replay being recorded, when the frames are recorded (their host events too).
     recorder: Option<Recorder>,
+    /// Work RAM writes of the test's own, made on the next frame after the driver's events (see [`Harness::frame`]).
+    queued: Vec<HostEvent>,
 }
 
 impl Harness {
     /// A harness of a machine and its driver, with nothing recorded.
     pub(crate) fn new(machine: Machine, driver: Driver) -> Self {
-        Self { machine, driver, tape: None, recorder: None }
+        Self { machine, driver, tape: None, recorder: None, queued: Vec::new() }
     }
 
-    /// One frame: the driver's joypad and host events for it (from the live one), the events made on
-    /// the machine, and the frame run.
+    /// A write of `bytes` at `address` in work RAM, made on the next frame as a host event: after the driver has read
+    /// the work RAM of that frame, so a recording keeps it on the frame where a replay makes it at the same point.
+    pub(crate) fn queue_write(&mut self, address: u32, bytes: Vec<u8>) {
+        self.queued.push(HostEvent::Wram { address, bytes });
+    }
+
+    /// One frame: the driver's joypad and host events for it (from the live one), the queued writes
+    /// after them, the events made on the machine, and the frame run.
     pub(crate) fn frame(&mut self, live: Joypad) -> anyhow::Result<()> {
-        let frame = self.driver.frame(self.machine.wram(), self.machine.sram(), live);
+        let mut frame = self.driver.frame(self.machine.wram(), self.machine.sram(), live);
+        frame.events.append(&mut self.queued);
         apply_events(&mut self.machine, &frame.events)?;
         match self.recorder.as_mut() {
             Some(recorder) => {
@@ -311,7 +320,7 @@ fn harness_with(rom: &[u8], starts: &Starts, bag: bool) -> anyhow::Result<Harnes
     if !bag {
         driver.set_binding(Binding::Recorded);
     }
-    Ok(Harness { machine, driver, tape: None, recorder: None })
+    Ok(Harness { machine, driver, tape: None, recorder: None, queued: Vec::new() })
 }
 
 /// The scenarios of the field suite, by name.
@@ -2313,6 +2322,146 @@ fn bag_kinds(_h: &mut Harness, r: &mut Report, rom: &[u8], base: &[u8]) -> anyho
     Ok(())
 }
 
+/// The items of the Namek elder's trade: twenty objects held before (the 4-star Dragon Ball, 36, among them), then two
+/// Scouters of each kind (16 and 17). The bag holds 22 stacks, one more than the original's list shows.
+const ELDER_TRADE_LIST: [u8; 24] =
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 18, 20, 21, 22, 36, 16, 16, 17, 17];
+/// The most presses of A [`answer_elder`] gives the elder's scene.
+const ELDER_PRESSES: u32 = 40;
+
+/// Starts the Namek elder's scene (`0x41`) on the field: the chapter's story flags as they are when he is met (flags
+/// 0x10 to 0x13 set, 0x14 to 0x17 clear), the scene's number, and `state_1648` at `$80`, which plays it. The writes
+/// are queued, so a recording keeps them. The scene's effect `0x64` (`03:D11F`) searches the original's list for both
+/// Scouters (`01:C6AE`); with both there it sets flag 0x14 and takes one of each (`01:C69B`), and the elder's
+/// messages then give the Namek frog card (24) and Piccolo (29) and set flag 0x15.
+fn force_elder_scene(h: &mut Harness) -> anyhow::Result<()> {
+    h.queue_write(d::STORY_FLAGS + 2, vec![0x0F]);
+    h.queue_write(d::SCENE_ID, vec![0x41]);
+    h.queue_write(d::STATE_1648, vec![0x80]);
+    h.frames(40)
+}
+
+/// The frames at which the elder's trade is first seen: flag 0x14 (both Scouters found), flag 0x15 (the trade made)
+/// and the Namek frog card (24) in the original's list.
+#[derive(Debug, Default, Clone, Copy)]
+struct ElderTimes {
+    flag14: Option<u64>,
+    flag15: Option<u64>,
+    frog_listed: Option<u64>,
+}
+
+impl ElderTimes {
+    /// Notes what the frame just run shows.
+    fn see(&mut self, h: &Harness) {
+        let at = h.machine.frame_count();
+        let flags = h.byte(d::STORY_FLAGS + 2);
+        if flags & 0x10 != 0 {
+            self.flag14.get_or_insert(at);
+        }
+        if flags & 0x20 != 0 {
+            self.flag15.get_or_insert(at);
+        }
+        let count = usize::from(h.byte(d::ITEM_COUNT)).min(24);
+        if (0..count).any(|i| h.byte(d::ITEM_LIST + 2 * i as u32) == 24) {
+            self.frog_listed.get_or_insert(at);
+        }
+    }
+}
+
+/// The player's part of the elder's scene: A (a press, then 39 frames), at most [`ELDER_PRESSES`] times, until both
+/// flags are set and no message is up (`message_state` bit 7). No A is given after that: on the field, a press would
+/// go on to the game's own menu. Every frame is watched for the times (the first look is at the frame before the
+/// first press).
+fn answer_elder(h: &mut Harness) -> anyhow::Result<ElderTimes> {
+    let mut times = ElderTimes::default();
+    times.see(h);
+    for _ in 0..ELDER_PRESSES {
+        if times.flag14.is_some() && times.flag15.is_some() && h.byte(d::MESSAGE_STATE) & 0x80 == 0
+        {
+            break;
+        }
+        for frame in 0..42 {
+            h.frame(if frame < 2 { a() } else { Joypad::default() })?;
+            times.see(h);
+        }
+    }
+    Ok(times)
+}
+
+/// The Namek elder's trade with 22 stacks in the bag (the original's list shows 21 of them): both Scouters are in the
+/// list the story searches, so the elder takes one of each and gives the Namek frog card (24) and Piccolo (29), and
+/// the bag follows. Then the same items on a Classic run (no bag, no hooks), whose list holds all 24: the same trade.
+fn elder_trade(h: &mut Harness, r: &mut Report, rom: &[u8], base: &[u8]) -> anyhow::Result<()> {
+    let units = |h: &Harness, object: u8| h.driver.bag().map_or(0, |bag| bag.units_of(object));
+    h.frames(2)?;
+    let stacks = h.driver.bag().map_or(0, |bag| bag.stacks().len());
+    r.check(
+        stacks == 22 && units(h, 16) == 2 && units(h, 17) == 2,
+        &format!(
+            "22 stacks, two Scouters of each kind: {stacks} stacks, {} and {}",
+            units(h, 16),
+            units(h, 17)
+        ),
+    );
+    r.check(list_is_projection(h), "the list is the bag's projection");
+    let (_, list) = bag_summary(h);
+    r.check(
+        list.contains(&16) && list.contains(&17),
+        &format!("the original's list holds both Scouters, 16 and 17: {list:?}"),
+    );
+    force_elder_scene(h)?;
+    let times = answer_elder(h)?;
+    let flags = h.byte(d::STORY_FLAGS + 2);
+    r.check(
+        flags & 0x30 == 0x30,
+        &format!("flags 0x14 and 0x15 are set: $0172 = {flags:02X}, {times:?}"),
+    );
+    r.check(
+        units(h, 24) == 1 && units(h, 29) == 1,
+        &format!(
+            "the bag holds the frog card (24) and Piccolo (29): {} and {}, {times:?}",
+            units(h, 24),
+            units(h, 29)
+        ),
+    );
+    r.check(
+        units(h, 16) == 1 && units(h, 17) == 1,
+        &format!(
+            "one Scouter of each kind is taken: {} and {} left, {times:?}",
+            units(h, 16),
+            units(h, 17)
+        ),
+    );
+    r.check(
+        list_is_projection(h),
+        &format!("the list is the bag's projection after the trade: {:?}", bag_summary(h).1),
+    );
+
+    // Classic: the same items, the list of 24 the original searches, no bag.
+    let starts = bag_start(rom, base, "elder-trade-classic", &ELDER_TRADE_LIST, None)?;
+    let mut classic = harness_with(rom, &starts, false)?;
+    classic.frames(2)?;
+    force_elder_scene(&mut classic)?;
+    let times = answer_elder(&mut classic)?;
+    let flags = classic.byte(d::STORY_FLAGS + 2);
+    let (_, list) = bag_summary(&classic);
+    let listed = |object: u8| list.iter().map(|&o| usize::from(o == object)).sum::<usize>();
+    r.check(
+        flags & 0x30 == 0x30,
+        &format!("Classic: flags 0x14 and 0x15 are set: $0172 = {flags:02X}, {times:?}"),
+    );
+    r.check(list.len() == 24, &format!("Classic: the list has 24 entries: {list:?}"));
+    r.check(
+        listed(24) == 1 && listed(29) == 1,
+        &format!("Classic: the list holds the frog card (24) and Piccolo (29): {list:?}"),
+    );
+    r.check(
+        listed(16) == 1 && listed(17) == 1,
+        &format!("Classic: one Scouter of each kind is left: {list:?}"),
+    );
+    Ok(())
+}
+
 /// The Dragon Radar's object id: its screen is the player's to leave (see [`bag_radar`]).
 const DRAGON_RADAR_ID: u8 = 23;
 
@@ -2373,11 +2522,30 @@ fn flow_heal(h: &mut Harness, out: &mut String) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The Namek elder's trade with 22 stacks in the bag, as a recording: the scene forced on the field, the elder's
+/// messages answered with A, the trade made.
+fn flow_elder(h: &mut Harness, out: &mut String) -> anyhow::Result<()> {
+    h.frames(30)?;
+    writeln!(out, "elder: the scene forced at frame {}", h.machine.frame_count())?;
+    force_elder_scene(h)?;
+    let times = answer_elder(h)?;
+    let at = |frame: Option<u64>| frame.map_or_else(|| "none".to_owned(), |f| f.to_string());
+    writeln!(out, "elder: flag 0x14 at frame {}", at(times.flag14))?;
+    writeln!(out, "elder: flag 0x15 at frame {}", at(times.flag15))?;
+    writeln!(out, "elder: object 24 in the list at frame {}", at(times.frog_listed))?;
+    writeln!(out, "elder: over at frame {}", h.machine.frame_count())?;
+    h.frames(SETTLE)?;
+    Ok(())
+}
+
 /// Records the Enhanced sessions the UI snapshots of the Use flow play back (`--snapshots DIR`): a Dragon Radar's use
 /// and a healing item on the second fighter, each from the Continue of a crafted save. The sessions are recorded
 /// unhooked (a recorder needs that) and played with the window's hooks, as the window plays them. Writes
 /// `radar.ssdreplay` and `heal.ssdreplay` in `dir` and prints the frame of each step, so that a snapshot can be taken
 /// at it (`ssd-recompiled --mode enhanced --replay FILE --headless-frames N --hd-scale 4 --ui-size 1488x956`).
+/// The third session is the Namek elder's trade with 22 stacks in the bag ([`flow_elder`]): the scene is forced by
+/// queued writes, which the replay keeps, and the frames of its flags, of the frog card in the list and of its end are
+/// printed. It is written as `elder.ssdreplay`.
 /// A recorded Use flow: it plays the item menu's keys on the harness and writes its notes.
 type Flow = fn(&mut Harness, &mut String) -> anyhow::Result<()>;
 
@@ -2387,8 +2555,9 @@ fn record_snapshots(rom: &[u8], base: &[u8], dir: &Path, out: &mut String) -> an
     let heal = craft_save_with_hp(rom, base, &[1, 1, 1], 0, 10)?;
     let catalogue = ssd_catalogue::Catalogue::from_rom(rom)?;
     let labels = ssd_catalogue::menu_labels(&catalogue);
-    let flows: [(&str, Vec<u8>, Flow); 2] =
-        [("radar", radar, flow_radar), ("heal", heal, flow_heal)];
+    let elder = craft_save(rom, base, &ELDER_TRADE_LIST, None)?;
+    let flows: [(&str, Vec<u8>, Flow); 3] =
+        [("radar", radar, flow_radar), ("heal", heal, flow_heal), ("elder", elder, flow_elder)];
     for (name, crafted, flow) in flows {
         let mut saves = MemorySaveStore::default();
         saves.0.insert("sav".to_owned(), crafted);
@@ -2400,6 +2569,7 @@ fn record_snapshots(rom: &[u8], base: &[u8], dir: &Path, out: &mut String) -> an
                 .with_cheats(ssd_menus::cheats::CheatSidecar::empty()),
             tape: None,
             recorder: Some(recorder),
+            queued: Vec::new(),
         };
         let continued =
             scripts::parse_timeline(&save::continue_prefix(0)).map_err(anyhow::Error::msg)?;
@@ -2492,7 +2662,7 @@ fn pictures_check(rom: &[u8], out: &mut String) -> anyhow::Result<bool> {
 /// The bag's scenarios from the base save: each builds its own crafted start.
 type BagScenario = fn(&mut Harness, &mut Report, &[u8], &[u8]) -> anyhow::Result<()>;
 
-const BAG_SCENARIOS: [(&str, BagScenario); 14] = [
+const BAG_SCENARIOS: [(&str, BagScenario); 15] = [
     ("original-items", |h, r, _, _| original_items(h, r)),
     ("use-bulma", |h, r, _, _| bag_use(h, r)),
     ("use-second", |h, r, _, _| bag_use_second(h, r)),
@@ -2507,6 +2677,7 @@ const BAG_SCENARIOS: [(&str, BagScenario); 14] = [
     ("save-continue", |h, r, rom, _| bag_save_continue(h, r, rom)),
     ("classic-rebuild", |h, r, rom, base| bag_classic_rebuild(h, r, rom, base)),
     ("bag-full", |h, r, rom, _| bag_full(h, r, rom)),
+    ("elder-trade", elder_trade),
 ];
 
 /// The items suite: each bag scenario from its crafted start, with its checks as a report.
@@ -2592,6 +2763,7 @@ fn bag_scenario(
         "pickup" | "save-continue" | "classic-rebuild" | "bag-full" => (0..21).collect(),
         "shop" => (0..20).collect(),
         "drop" => vec![2, 2, 16],
+        "elder-trade" => ELDER_TRADE_LIST.to_vec(),
         _ => Vec::new(),
     };
     let hp = matches!(name, "use-bulma" | "use-second").then_some(30);
@@ -2629,6 +2801,7 @@ fn round_trip(rom: &[u8], base: &[u8], out: &mut String) -> anyhow::Result<bool>
         driver: Driver::with_bag(labels.clone(), Rules::default(), Sidecar::empty()),
         tape: None,
         recorder: Some(recorder),
+        queued: Vec::new(),
     };
     let continued =
         scripts::parse_timeline(&save::continue_prefix(0)).map_err(anyhow::Error::msg)?;
