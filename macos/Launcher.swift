@@ -28,7 +28,10 @@ struct Launcher {
         NSApplication.shared.setActivationPolicy(.accessory)
         NSApplication.shared.activate(ignoringOtherApps: true)
         do {
-            let support = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            // An absolute alternate root permits a real launcher smoke test without touching player data.
+            let override = ProcessInfo.processInfo.environment["DBZ_SSD_MAC_TEST_SUPPORT"]
+            let support = override.flatMap { $0.hasPrefix("/") && $0 != "/" ? URL(fileURLWithPath: $0, isDirectory: true) : nil }
+                ?? fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             let base = try LauncherSupport.prepareDataDirectory(in: support)
             guard let resources = Bundle.main.resourceURL else {
                 throw NSError(domain: "DBZLauncher", code: 1,
